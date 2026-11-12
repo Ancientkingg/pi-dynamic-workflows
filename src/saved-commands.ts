@@ -4,7 +4,8 @@
  */
 
 import { createCodingTools, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { claimCommand, commandOwner, isCommandRegistered } from "./command-registry.js";
+import { claimCommand, commandOwner, isCommandRegistered, isPiReservedCommandName } from "./command-registry.js";
+import { backgroundStartNotice } from "./display.js";
 import { runWorkflow, type WorkflowRunResult } from "./workflow.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
@@ -22,6 +23,9 @@ export function savedWorkflowCommandAvailability(
   pi: ExtensionAPI,
   name: string,
 ): { ok: true } | { ok: false; message: string } {
+  if (isPiReservedCommandName(name)) {
+    return { ok: false, message: `/${name} is reserved by Pi and cannot be used as a saved workflow name.` };
+  }
   if (!isCommandRegistered(pi, name) || savedCommandOwnedByExtension(pi, name)) return { ok: true };
   return { ok: false, message: `/${name} is already provided by Pi or another extension.` };
 }
@@ -83,10 +87,7 @@ export function registerSavedWorkflow(
               liveWorkflow.script,
               parseCommandArgs(args, liveWorkflow.parameters),
             );
-            ctx.ui.notify(
-              `/${liveWorkflow.name} running in the background (${runId}) — watch the task panel or /workflows; the result is posted here when it finishes.`,
-              "info",
-            );
+            ctx.ui.notify(backgroundStartNotice(liveWorkflow.name, runId, ctx.mode, "result"), "info");
             return;
           }
           const liveCwd = getCwd();
@@ -96,6 +97,9 @@ export function registerSavedWorkflow(
             args: parseCommandArgs(args, liveWorkflow.parameters),
             tools: createCodingTools(liveCwd),
             onPhase: (title) => ctx.ui.setStatus(`wf:${liveWorkflow.name}`, `${liveWorkflow.name}: ${title}`),
+            // Manager-less fallback (production always goes through getManager):
+            // legacy routing only — no mainModel/inheritMainModel plumbing, so
+            // untagged agents follow the implicit medium tier / settings default.
           });
           ctx.ui.setStatus(`wf:${liveWorkflow.name}`, undefined);
           await pi.sendMessage({

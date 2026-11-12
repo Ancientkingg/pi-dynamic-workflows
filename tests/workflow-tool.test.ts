@@ -8,7 +8,12 @@ import { BUILTIN_WORKFLOW_NAMES } from "../src/builtin-workflows.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
-import { backgroundStartedText, createWorkflowTool, WORKFLOW_GATE_GUIDELINE } from "../src/workflow-tool.js";
+import {
+  backgroundStartedText,
+  createWorkflowTool,
+  resumedText,
+  WORKFLOW_GATE_GUIDELINE,
+} from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Minimal fake ModelRegistry, matching the shape used by workflow manager tests. */
@@ -383,6 +388,90 @@ test(
 );
 
 test(
+  "workflow tool: the resume confirmation describes the EFFECTIVE (persisted) replay policy, not the omitted parameter (#231 R3)",
+  withToolTempCwd(async (cwd) => {
+    const attempts = new Map<string, number>();
+    let markFirst: () => void = () => {};
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirst = resolve;
+    });
+    let markSecond: () => void = () => {};
+    const secondStarted = new Promise<void>((resolve) => {
+      markSecond = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void; signal?: AbortSignal }) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          const attempt = (attempts.get(prompt) ?? 0) + 1;
+          attempts.set(prompt, attempt);
+          if (prompt === "p0" && attempt <= 2) {
+            (attempt === 1 ? markFirst : markSecond)();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const fanoutScript = `export const meta = { name: 'fan_gap', description: 'fan-out gap' }
+const xs = await parallel(['p0','p1','p2'].map((p) => () => agent(p, { label: p })))
+return xs`;
+
+    const { runId, promise } = manager.startInBackground(fanoutScript);
+    promise.catch(() => {});
+    await firstStarted;
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+    // Persist replay-completed via a first resume (paused again mid-gap-retry).
+    assert.equal(await manager.resume(runId, { resumeMode: "replay-completed" }), true);
+    await secondStarted;
+    assert.equal(manager.pause(runId), true);
+    assert.equal(manager.getPersistence().load(runId)?.resumeMode, "replay-completed");
+
+    // The tool resume OMITS resumeMode: the run's persisted replay-completed
+    // policy is what will actually execute, and the confirmation must say so.
+    const tool = createWorkflowTool({ cwd, manager });
+    const result = await tool.execute(
+      "t-resume",
+      { script: fanoutScript, resumeFromRunId: runId },
+      undefined,
+      undefined,
+      undefined,
+    );
+    assert.deepEqual(
+      (result as { structuredContent?: unknown }).structuredContent,
+      { runId, status: "resumed" },
+      "the persisted replay-completed policy retains the structured resume outcome",
+    );
+    const text = (result.content[0] as { type: "text"; text: string }).text;
+    assert.match(
+      text,
+      /fan-out siblings across a never-completed gap/,
+      "the confirmation describes the effective replay-completed policy",
+    );
+    assert.doesNotMatch(
+      text,
+      /changed, new, or never-completed agent\(\) call/,
+      "it does not describe the prefix-only policy",
+    );
+
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.getPersistence().load(runId)?.status, "completed");
+    assert.equal(attempts.get("p1"), 1, "the persisted replay-completed policy really did replay p1");
+    assert.equal(attempts.get("p2"), 1, "the persisted replay-completed policy really did replay p2");
+  }),
+);
+
+test(
   "workflow tool: resumeFromRunId pointing at a running run errors clearly",
   withToolTempCwd(async (cwd) => {
     const da = deferredToolAgent();
@@ -415,6 +504,38 @@ test(
     // The returned text advertises the revise/iterate path.
     const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
     assert.match(text, /resumeFromRunId/, "background text tells the model how to iterate");
+  }),
+);
+
+test(
+  "workflow tool: results carry codemode structuredContent under a declared outputSchema",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    assert.ok(
+      (tool as { outputSchema?: unknown }).outputSchema,
+      "the declaration carries an outputSchema so codemode resolves structured data instead of prose",
+    );
+
+    const started = await tool.execute("sc1", { script: resumeToolScript }, undefined, undefined, undefined);
+    const startedRunId = (started.details as { runId?: string }).runId;
+    assert.ok(startedRunId);
+    assert.deepEqual((started as { structuredContent?: unknown }).structuredContent, {
+      runId: startedRunId,
+      status: "started",
+    });
+
+    const syncScript = `export const meta = { name: 'sync_sc', description: 'sync' }
+return await agent('one')`;
+    const done = await tool.execute("sc2", { script: syncScript, background: false }, undefined, undefined, undefined);
+    const doneRunId = (done.details as { runId?: string }).runId;
+    assert.ok(doneRunId);
+    assert.deepEqual(
+      (done as { structuredContent?: unknown }).structuredContent,
+      { runId: doneRunId, status: "completed", result: "ok" },
+      "a synchronous call resolves with the workflow's return value",
+    );
   }),
 );
 
@@ -460,6 +581,11 @@ return { a, b }`;
     const details = res.details as { runId?: string; resumedFrom?: string };
     assert.equal(details.runId, runId, "resumed run keeps the same run id");
     assert.equal(details.resumedFrom, runId);
+    assert.deepEqual(
+      (res as { structuredContent?: unknown }).structuredContent,
+      { runId, status: "resumed" },
+      "codemode callers receive the structured resume outcome",
+    );
     const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
     assert.match(text, new RegExp(`resumed from run ${runId}`), "text names the resumed run");
 
@@ -651,5 +777,139 @@ test(
         ),
       /cannot be combined with `resumeFromRunId`/,
     );
+  }),
+);
+
+test(
+  "workflow tool: a failing script leaves no pending progress render behind (audit2 r1 m1/m2)",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+    const tool = createWorkflowTool({ cwd, manager });
+    const updates: unknown[] = [];
+    // log() arms the coalesced render timer; the script never calls agent() →
+    // the tool throws agentCount===0 — no stray post-failure update may fire.
+    const logOnlyScript = `export const meta = { name: 'log_only', description: 'log only' }
+log('progress without agents')
+return 'never reaches agents'`;
+    await assert.rejects(() =>
+      tool.execute(
+        "tl1",
+        { script: logOnlyScript, background: false },
+        undefined,
+        (u: unknown) => updates.push(u),
+        undefined,
+      ),
+    );
+    const updatesAtThrow = updates.length;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(updates.length, updatesAtThrow, "no stray render after the tool already rejected");
+  }),
+);
+
+test(
+  "workflow tool: the non-abort error path renders the latest coalesced progress frame (audit2 r1 m2)",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError("boom", WorkflowErrorCode.AGENT_FAILED, { recoverable: false });
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    const updates: string[] = [];
+    // log() then a non-recoverable agent failure inside the 100ms coalesce
+    // window: flushProgress must render the pending frame, not drop it.
+    const failScript = `export const meta = { name: 'fail_fast', description: 'fail fast' }
+log('about to fail')
+await agent('x')
+return 'unreachable'`;
+    await assert.rejects(() =>
+      tool.execute(
+        "tl2",
+        { script: failScript, background: false },
+        undefined,
+        (u: { content?: Array<{ text?: string }> }) => updates.push(u?.content?.[0]?.text ?? ""),
+        undefined,
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.ok(updates.length >= 1, "the pending coalesced frame was flushed (rendered) on the error path");
+  }),
+);
+
+test("resumedText states the same-window workflow() caveat and no gap absolutes (#231 R11)", () => {
+  // The replay-completed result text is the only model-facing surface that
+  // describes the resume outcome for THIS run; it must match the schema's
+  // dispatch-timing rule (and must not re-grow the removed absolutes — R9's
+  // silent revert went undetected precisely because no test pinned the text).
+  const text = resumedText("wf", "run-1", "replay-completed");
+  assert.ok(
+    text.includes("dispatched in the gap's own window replays with its child journal"),
+    "the same-window workflow() replay caveat is stated",
+  );
+  assert.equal(text.includes("everything later in its frame"), false);
+  assert.equal(text.includes("everything after a top-level gap"), false);
+  const prefix = resumedText("wf", "run-1", "prefix");
+  assert.ok(prefix.includes("re-runs live."), "the prefix variant still renders");
+});
+
+test(
+  "workflow tool: an all-failed fleet puts each agent's error in the tool result text",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError(
+            "prompt-capture: no capture for this prompt",
+            WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+            {
+              recoverable: true,
+            },
+          );
+        },
+      },
+    });
+    const tool = createWorkflowTool({ cwd, manager });
+    const script = `export const meta = { name: 'all_fail', description: 'all fail' }
+return await agent('x', { label: 'solo' })`;
+    const done = await tool.execute("af1", { script, background: false }, undefined, undefined, undefined);
+    const text = (done as { content: Array<{ text: string }> }).content[0].text;
+    assert.match(text, /no usable results/);
+    assert.match(text, /solo: prompt-capture: no capture for this prompt/);
+  }),
+);
+
+test(
+  "workflow tool: renderResult draws an all-failed fleet's cause in the TUI once the run is complete",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError(
+            "prompt-capture: no capture for this prompt",
+            WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+            { recoverable: true },
+          );
+        },
+      },
+    });
+    const tool = createWorkflowTool({ cwd, manager });
+    const script = `export const meta = { name: 'all_fail_tui', description: 'all fail' }
+return await agent('x', { label: 'solo' })`;
+    const done = await tool.execute("af2", { script, background: false }, undefined, undefined, undefined);
+    const theme = { fg: (_color: string, s: string) => s, bold: (s: string) => s };
+    const draw = (isPartial: boolean) =>
+      tool
+        .renderResult?.(done as never, { isPartial, expanded: false } as never, theme as never, {} as never)
+        .render(400)
+        .join("\n") ?? "";
+
+    assert.match(draw(false), /solo: prompt-capture: no capture for this prompt/);
+    assert.doesNotMatch(draw(true), /no usable results/, "a partial frame shows no completion diagnostics");
   }),
 );

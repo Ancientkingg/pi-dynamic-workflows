@@ -2,7 +2,7 @@
 # Exhaustive workflow capability facts
 
 Contract format: `1.0.0`<br>
-Contract content / skill / extension: `3.9.0`
+Contract content / skill / extension: `3.15.1`
 
 Every exact fact below is projected from the installed extension's capability contract. Explanatory judgment belongs in the hand-written references next to this file.
 
@@ -17,23 +17,32 @@ Every exact fact below is projected from the installed extension's capability co
 - `phase`: string (optional; default: current phase)
 - `schema`: plain JSON Schema (optional)
 - `model`: string (optional; highest-priority exact model selector)
+- `thinking`: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" (optional; call-site value overrides agentType thinking; selected model suffix takes precedence; invalid values fail before dispatch)
 - `tier`: string (optional; configured route name; dynamic reference: model-routes)
-- `isolation`: "worktree" (optional)
+- `isolation`: "worktree" | false (optional)
+- `keepWorktree`: boolean (optional; default: true)
+- `cwd`: string (optional; non-empty absolute existing directory; resolved to its real path; coding tools and session cwd use the target directory; settings and AGENTS/skill resources also use it unless explicitly injected by the embedding host; cannot combine with worktree isolation)
 - `thread`: string (optional; non-empty name; same-name calls must be sequential)
 - `agentType`: string (optional; must come from provided context; dynamic reference: agent-types)
-- `timeoutMs`: number | null (optional; default: run timeout; null disables)
+- `timeoutMs`: number | null (optional; default: run timeout, finite ms in [1, 2^31-1]; null disables)
 - `retries`: number (optional; default: run retry count; finite values are floored and clamped to 0..3)
 - Constraint: recoverable failures return null after retries; nonrecoverable failures throw
 - Constraint: schema noncompliance after bounded structured-output repair is nonrecoverable and bypasses agent retries
 - Constraint: per-agent retries override invocation retries; retries are floored and clamped to 0..3
-- Constraint: resume replays only the longest unchanged prefix; the first miss and every later call execute live
+- Constraint: under the default prefix resume policy, resume replays only the longest unchanged prefix; the first miss and every later call execute live (see the resumeMode tool input)
 - Constraint: a named thread retains its full Pi transcript and session identity only within one uninterrupted workflow invocation
 - Constraint: threaded calls are live-execution resume barriers and are never journaled
 - Constraint: same-thread calls must be sequential; threads cannot use worktree isolation
-- Constraint: selector priority is explicit model > agentType model > tier > phase model > metadata model > implicit medium > session default
+- Constraint: a named thread's canonical cwd is fixed by its first call; a later call using that name with a different cwd fails validation instead of reusing the prior transcript
+- Constraint: an explicit cwd must be a non-empty absolute existing directory; its real path determines coding tools and session cwd; default settings and AGENTS/skill resources follow it while embedding-host dependency overrides remain authoritative; it participates in resume identity and cannot combine with worktree isolation
+- Constraint: selector priority is explicit model > agentType model > tier > phase model > metadata model > inherited main model (inheritMainModel on) > implicit medium > session default
 - Constraint: an explicit model, agentType model, tier, or phase model that resolves to an unavailable model throws MODEL_NOT_FOUND naming the source (e.g. the tier and what it resolved to) instead of falling back
-- Constraint: only the implicit default medium tier (no explicit model, tier, agentType, or phase model requested) degrades to the session default when unavailable, logging a one-time run-visible warning instead of throwing
-- Constraint: worktree isolation is best-effort; failure logs that isolation was ignored and continues without an isolated working directory
+- Constraint: only the implicit route an untagged agent falls into — the implicit default medium tier, or the inherited main model when inheritMainModel is on (no explicit model, tier, agentType, or phase model requested) — degrades to the session default when unavailable, logging a one-time run-visible warning instead of throwing
+- Constraint: with the inheritMainModel setting on, an untagged agent (no explicit model, tier, agentType model, or phase model) inherits the session's main model (the model in effect when the run starts) instead of the implicit medium tier or the settings default; an unavailable inherited model degrades to the settings default with a one-time run-visible warning instead of throwing
+- Constraint: requested worktree isolation fails closed before agent execution if git cannot create the worktree; it never falls back to the shared checkout
+- Constraint: isolation: false opts out of an agentType worktree default
+- Constraint: keepWorktree defaults true (worktree kept for merge); false deletes after the call
+- Constraint: each live execution creates a uniquely owned worktree; retries or resume never reuse or overwrite a retained worktree
 
 <a id="parallel"></a>
 ## parallel
@@ -64,7 +73,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Signature: `workflow(savedName, childArgs?) => Promise<unknown>`
 - Constraint: one nested level
 - Constraint: shares limiter, counters, token accounting, and store
-- Constraint: nested workflows do not reuse the parent resume journal
+- Constraint: a nested workflow journals under its own runId and replays those entries only while the parent's replay is still open at the workflow() call; a parent edit, or a parent gap shadowing the call, re-executes the child live, and a gap or edit inside the child re-runs the parent's calls dispatched after the child returns
 
 <a id="verify"></a>
 ## verify
@@ -163,7 +172,7 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `checkpoint(prompt, options?) => Promise<unknown>`
+- Signature: `checkpoint(prompt, options?) \| checkpoint({ kind, checkpointId, payload }) => Promise<unknown>`
 - Option shape: `checkpoint-options`
 - `default`: unknown (optional; default: true when no UI and omitted)
 - `headless`: "default" | "abort" (optional; default: "default")
@@ -173,6 +182,10 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: foreground confirm and headless behavior are implemented; input/select/timeout are declared-only
 - Constraint: consumes one agent slot and no tokens
 - Constraint: journaled answers replay only within an unchanged resume prefix
+- Constraint: object checkpoints accept an open kind identifier, persist their JSON payload, and pause the run
+- Constraint: a controller attaches a lossless-JSON response to the run and checkpoint before workflow_control resumes with only the exact run ID and checkpoint ID
+- Constraint: status exposes only checkpoint ID, kind, and status; the durable response never enters model-visible output
+- Constraint: durable checkpoint responses resume the same run ID, are journaled before continuation, and reject stale or conflicting delivery
 
 <a id="log"></a>
 ## log
@@ -310,8 +323,20 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `resumeFromRunId?: string`
 - Constraint: resumes a prior incomplete run with an edited script
-- Constraint: unchanged positional agent calls replay from cache until the first changed or inserted call
+- Constraint: under the default prefix policy, unchanged positional agent calls replay from cache until the first changed, inserted, or never-completed call
 - Constraint: always runs in the background
+
+<a id="tool-input-resumemode"></a>
+## resumeMode
+
+- Classification: `workflow-tool-input`
+- Support: `supported`
+- Signature: `resumeMode?: "prefix" \| "replay-completed" = "prefix"`
+- Constraint: applies only together with resumeFromRunId
+- Constraint: prefix: the first changed, new, or never-completed call and every later call re-run live
+- Constraint: replay-completed: completed calls replay across a never-completed gap only when dispatched concurrently with the gap in one fan-out; a changed call still re-runs its whole suffix
+- Constraint: an explicit choice persists on the run; later resumes keep it unless overridden
+- Constraint: shared-store and filesystem results are not hash-checked and can replay stale across a gap
 
 <a id="metadata"></a>
 ## export const meta

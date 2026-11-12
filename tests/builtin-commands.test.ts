@@ -374,6 +374,28 @@ test("built-in handlers start a background run and return immediately (#104)", a
   assert.ok(notified[0].message.includes("background"), "start notice should say it runs in the background");
 });
 
+test("background start notice is mode-aware: TUI points at the task panel, other hosts at /workflows status", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager } = makeFakeManager();
+  registerBuiltinWorkflows(pi, { cwd: "/tmp", manager });
+  const handler = commands.find((c) => c.name === "adversarial-review")?.handler;
+  assert.ok(handler);
+
+  const tui = makeNotifyCtx("tui");
+  await handler("audit the error paths", tui.ctx);
+  assert.ok(tui.notified[0].message.includes("task panel"), "TUI notice should point at the task panel");
+
+  // RPC hosts (e.g. Paseo) cannot render the TUI task panel or navigator —
+  // the notice must point at the plain-text status command instead.
+  const rpc = makeNotifyCtx("rpc");
+  await handler("audit the error paths", rpc.ctx);
+  assert.ok(!rpc.notified[0].message.includes("task panel"), "RPC notice must not mention the task panel");
+  assert.ok(
+    rpc.notified[0].message.includes("/workflows status run-test-2"),
+    `RPC notice should point at /workflows status <id>, got: ${rpc.notified[0].message}`,
+  );
+});
+
 test("deep-research passes web tools on top of coding tools to its run", async () => {
   const { pi, commands } = makeCommandRegistryPi();
   const { manager, started } = makeFakeManager();
@@ -567,4 +589,117 @@ test("codebase-audit handler passes a quote-laden check through without throwing
   assert.equal(started.length, 1);
   const { meta } = parseWorkflowScript(started[0].script);
   assert.equal(meta.name, "codebase_audit");
+});
+
+test("a saved shadow of a builtin receives the builtin's positional argument (audit2 #43)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, {
+    cwd: "/tmp",
+    manager,
+    storage: makeFakeStorage({
+      "deep-research": { script: "export const meta = { name: 'shadow', description: 's' }" },
+    }),
+  });
+  const handler = commands.find((c) => c.name === "deep-research")?.handler;
+  assert.ok(handler);
+  const { ctx } = makeNotifyCtx();
+  await handler("quantum computing advances", ctx);
+  assert.equal(started.length, 1, "the shadow ran");
+  const args = started[0].args as Record<string, unknown>;
+  assert.equal(args.question, "quantum computing advances", "bare positional maps to the builtin's question contract");
+});
+
+test("a saved shadow does not override an explicitly named argument (audit2 #43)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, {
+    cwd: "/tmp",
+    manager,
+    storage: makeFakeStorage({
+      "deep-research": { script: "export const meta = { name: 'shadow', description: 's' }" },
+    }),
+  });
+  const handler = commands.find((c) => c.name === "deep-research")?.handler;
+  assert.ok(handler);
+  const { ctx } = makeNotifyCtx();
+  await handler("question=explicit-topic extra words", ctx);
+  const args = started[0].args as Record<string, unknown>;
+  assert.equal(args.question, "explicit-topic", "the named arg wins; positionals stay in _");
+});
+
+test("shadow positional mapping: equals-only topics, defaults, and structured secondaries (audit2 #43 r1)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, {
+    cwd: "/tmp",
+    manager,
+    storage: makeFakeStorage({
+      "deep-research": {
+        script: "export const meta = { name: 'shadow', description: 's' }",
+        parameters: { question: { default: "DEFAULT" } },
+      },
+      "multi-perspective": { script: "export const meta = { name: 'mps', description: 's' }" },
+    }),
+  });
+  const { ctx } = makeNotifyCtx();
+  const deep = commands.find((c) => c.name === "deep-research")?.handler;
+  const mps = commands.find((c) => c.name === "multi-perspective")?.handler;
+  assert.ok(deep && mps);
+
+  // "="-containing topic survives (parseCommandArgs treats it as key=value).
+  assert.ok(deep);
+  await deep("a=b=c", ctx);
+  assert.equal((started[0].args as Record<string, unknown>).question, "a=b=c");
+
+  // A bare positional beats the declared parameter default.
+  await deep("explicit topic", ctx);
+  assert.equal((started[1].args as Record<string, unknown>).question, "explicit topic");
+
+  // Structured secondary: first token → topic, rest → perspectives.
+  assert.ok(mps);
+  await mps("auth-flows security performance", ctx);
+  const mpArgs = started[2].args as Record<string, unknown>;
+  assert.equal(mpArgs.topic, "auth-flows");
+  assert.deepEqual(mpArgs.perspectives, ["security", "performance"]);
+});
+
+test("shadow tokenized mapping is quote-aware like the builtin (audit2 #43 r2)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, {
+    cwd: "/tmp",
+    manager,
+    storage: makeFakeStorage({
+      "multi-perspective": { script: "export const meta = { name: 'mps', description: 's' }" },
+    }),
+  });
+  const mps = commands.find((c) => c.name === "multi-perspective")?.handler;
+  assert.ok(mps);
+  const { ctx } = makeNotifyCtx();
+  await mps('"auth flows" security performance', ctx);
+  const args = started[0].args as Record<string, unknown>;
+  assert.equal(args.topic, "auth flows", "quoted multi-word topic, exactly like the builtin");
+  assert.deepEqual(args.perspectives, ["security", "performance"]);
+});
+
+test("shadow whole-string mapping keeps equals-containing topics whole (audit2 #43 r2)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, {
+    cwd: "/tmp",
+    manager,
+    storage: makeFakeStorage({
+      "deep-research": { script: "export const meta = { name: 'shadow', description: 's' }" },
+    }),
+  });
+  const deep = commands.find((c) => c.name === "deep-research")?.handler;
+  assert.ok(deep);
+  const { ctx } = makeNotifyCtx();
+  await deep("what does a=b mean", ctx);
+  assert.equal(
+    (started[0].args as Record<string, unknown>).question,
+    "what does a=b mean",
+    "the full trimmed string, exactly like the builtin",
+  );
 });

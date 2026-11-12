@@ -7,6 +7,7 @@ import {
   WorkflowErrorCode,
   wrapError,
 } from "../src/errors.js";
+import { parseResetHintMs } from "../src/usage-limit-scheduler.js";
 
 describe("classifyProviderLimit", () => {
   it("matches the documented provider usage/quota/rate-limit wordings", () => {
@@ -18,6 +19,10 @@ describe("classifyProviderLimit", () => {
       "Error 429: too many requests",
       "rate limit exceeded",
       "GoUsageLimitError",
+      "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.",
+      "You are out of your extra usage",
+      "You've run out of extra usage.",
+      "out of  included usage",
     ];
     for (const text of cases) {
       assert.equal(classifyProviderLimit(text).matched, true, `should match: ${text}`);
@@ -30,6 +35,7 @@ describe("classifyProviderLimit", () => {
       "TypeError: x is not a function",
       "agent exploded",
       "overloaded_error",
+      "ran out of usage examples",
       undefined,
     ]) {
       assert.equal(classifyProviderLimit(text).matched, false, `should not match: ${text}`);
@@ -43,6 +49,18 @@ describe("classifyProviderLimit", () => {
       "resets at 2026-06-20T06:00:00Z",
     );
     assert.equal(classifyProviderLimit("insufficient_quota").resetHint, undefined);
+  });
+
+  it("extracts the pi-ai Codex 'Try again in ~N min' hint (audit2 #10)", () => {
+    assert.equal(
+      classifyProviderLimit("You have hit your ChatGPT usage limit (plus plan). Try again in ~299 min.").resetHint,
+      "Try again in ~299 min",
+    );
+    // The extracted hint feeds the scheduler's parser end-to-end.
+    assert.equal(
+      parseResetHintMs(classifyProviderLimit("usage limit reached. Try again in ~299 min.").resetHint),
+      299 * 60_000,
+    );
   });
 });
 

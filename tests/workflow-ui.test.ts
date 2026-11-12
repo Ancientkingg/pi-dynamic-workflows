@@ -213,6 +213,7 @@ test("NavigatorModel reads runs, phases, agents, and detail", () => {
 
 test("NavigatorModel handles unknown runId gracefully", () => {
   const model = new NavigatorModel(fakeManager());
+
   assert.deepEqual(model.phases("unknown"), []);
   assert.deepEqual(model.agents("unknown", "Scan"), []);
   assert.equal(model.agentDetail("unknown", 1), undefined);
@@ -838,6 +839,8 @@ test("renderNavigator shows saved detail view", () => {
   assert.match(text, /analyze/);
   assert.match(text, /Analyze deps/);
   assert.match(text, /Location:/);
+  assert.match(text, /Path:/);
+  assert.ok(text.includes("/y"));
   assert.match(text, /Script:/);
   assert.match(text, /Saved at:/);
   assert.match(text, /PgUp\/PgDn page/);
@@ -1478,6 +1481,58 @@ test("component rename strips astral format characters and keeps the same safe n
   assert.ok(notifications.every((notice) => !notice.message.includes("invalid")));
 });
 
+test("component rename rejects Pi interactive-only command names before storage", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+  const workflow = {
+    name: "safe",
+    description: "safe workflow",
+    script: "export SAFE",
+    location: "project" as const,
+    source: "project" as const,
+    path: "/safe.json",
+    savedAt: "2025-01-01",
+  } as SavedWorkflow;
+  let renameCalls = 0;
+  const storage = {
+    list: () => [workflow],
+    rename: () => {
+      renameCalls++;
+      return { ok: true as const, workflow };
+    },
+    delete: () => true,
+  };
+  const manager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [] as PersistedRunState[],
+    getRun: () => undefined,
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, manager, ui, { storage: storage as unknown as WorkflowStorage }).catch(
+    () => {},
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  const component = getComponent();
+  assert.ok(component);
+
+  for (const name of ["debug", "arminsayshi", "dementedelves"]) {
+    component.handleInput("r");
+    for (let index = 0; index < workflow.name.length; index++) component.handleInput("\b");
+    component.handleInput(name);
+    component.handleInput("\r");
+  }
+
+  assert.equal(renameCalls, 0, "host-reserved renames must not reach storage");
+  for (const name of ["debug", "arminsayshi", "dementedelves"]) {
+    assert.ok(
+      notifications.some(
+        (notice) => notice.type === "error" && new RegExp(`${name}.*reserved by Pi`).test(notice.message),
+      ),
+    );
+  }
+});
+
 test("component manager refresh invalidates a stale confirmation instead of acting on the new row", async () => {
   const { ui, getComponent } = fakeUiCapturingComponent();
   const run = {
@@ -1662,4 +1717,97 @@ test("component saved detail exposes confirmation before delete", async () => {
   assert.match(confirming.join("\n"), /confirm delete/);
   component.handleInput("x");
   assert.equal(deleted, 1);
+});
+
+test("a manager event with the target unchanged does NOT cancel a pending confirmation (audit2 #22)", async () => {
+  const { ui, getComponent } = fakeUiCapturingComponent();
+  const run = {
+    runId: "run-live",
+    workflowName: "live",
+    status: "running",
+    phases: [],
+    agents: [],
+    logs: [],
+  } as unknown as PersistedRunState;
+  const listeners = new Map<string, () => void>();
+  let stopped = 0;
+  const manager = {
+    on: (event: string, listener: () => void) => listeners.set(event, listener),
+    off: () => {},
+    listRuns: () => [run],
+    getRun: () => undefined,
+    stop: () => {
+      stopped++;
+      return true;
+    },
+    pause: () => true,
+    resume: () => true,
+    deleteRun: () => true,
+  } as unknown as WorkflowManager;
+  const storage = {
+    list: () => [],
+    delete: () => true,
+  } as unknown as WorkflowStorage;
+
+  openWorkflowNavigator({} as ExtensionAPI, manager, ui, { storage }).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+  const component = getComponent();
+  assert.ok(component);
+
+  component.handleInput("x");
+  assert.match((component.render?.(80) ?? []).join("\n"), /confirm stop/);
+  // Streaming progress events (the row unchanged) must not cancel the pending
+  // confirmation — previously ANY manager event did, making double-x unusable.
+  listeners.get("tokenUsage")?.();
+  listeners.get("agentModel")?.();
+  component.handleInput("x");
+  assert.equal(stopped, 1, "the second x confirms after unrelated manager events");
+});
+
+test("NavigatorModel carries the estimate flag onto run and phase rows (#209)", () => {
+  const base = fakeManager();
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: base.listRuns,
+    getRun: (id) => {
+      const run = base.getRun(id);
+      if (!run) return run;
+      // One agent's figures are heuristic-derived; the run aggregate is
+      // metered but SMALLER, so the flagged agent sum wins the row's size
+      // comparison — the row flag must come from the CHOSEN (displayed)
+      // source, not blanket-ORed from the aggregate.
+      const snapshot = {
+        ...run.snapshot,
+        tokenUsage: { input: 0, output: 0, total: 100, cost: 0, cacheRead: 0, cacheWrite: 0 },
+        agents: run.snapshot.agents.map((a, i) =>
+          i === 0
+            ? {
+                ...a,
+                tokenUsage: {
+                  input: 0,
+                  output: 100,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  total: 100,
+                  cost: 0,
+                  estimated: true,
+                },
+              }
+            : a,
+        ),
+      };
+      return { ...run, snapshot } as unknown as ManagedRun;
+    },
+  };
+  const model = new NavigatorModel(manager);
+  assert.equal(model.runs()[0]?.estimated, true, "run row flags estimate-derived figures");
+  assert.equal(model.phases("run-1")[0]?.estimated, true, "phase row flags estimate-derived figures");
+
+  // The two-pane header ORs its phase flags into the header's ~ marker. Assert
+  // the header's own summary line (line 1: status + totals) — agent/phase rows
+  // below also render ~, so a whole-render regex would mask a broken header OR.
+  const state = new NavigatorState();
+  assert.ok(state.drill(model), "drill into phases");
+  const rendered = renderNavigator(state, model, 80);
+  assert.match(rendered[1] ?? "", /~\d/, "header summary line marks estimate-derived totals with ~");
 });

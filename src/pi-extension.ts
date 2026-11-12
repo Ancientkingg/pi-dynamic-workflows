@@ -1,0 +1,409 @@
+import { closeSync, existsSync, openSync, readSync } from "node:fs";
+import { resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { createCodingTools, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { registerBuiltinWorkflows } from "./builtin-commands.js";
+import { createEffortState, type EffortState, registerEffortCommand } from "./effort-command.js";
+import {
+  claimWorkflowRuntime,
+  discardWorkflowRuntime,
+  handoffWorkflowRuntime,
+  pauseStrandedWorkflowRuntime,
+  SESSION_REPLACEMENT_REASONS,
+  WORKFLOW_EXTENSION_VERSION,
+  type WorkflowReloadRuntime,
+} from "./extension-reload.js";
+import { registerAllSavedWorkflows } from "./saved-commands.js";
+import {
+  bindSessionDelivery,
+  dropSessionDelivery,
+  installResultDelivery,
+  installTaskPanel,
+  suspendResultDelivery,
+} from "./task-panel.js";
+import { UsageLimitScheduler } from "./usage-limit-scheduler.js";
+import { createBuiltinWebTools } from "./web-tools.js";
+import { registerWorkflowCommands } from "./workflow-commands.js";
+import { createWorkflowControlTool } from "./workflow-control-tool.js";
+import { installWorkflowKeywordArming } from "./workflow-editor.js";
+import { WorkflowManager } from "./workflow-manager.js";
+import { installWorkflowProgress } from "./workflow-progress.js";
+import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
+import { loadWorkflowSettings, saveWorkflowSettingsForCwd } from "./workflow-settings.js";
+import { createWorkflowTool } from "./workflow-tool.js";
+import { registerWorkflowModelsCommand } from "./workflows-models-command.js";
+
+export { installHostCreateAgentSession } from "./agent.js";
+export { installHostSessionCapture } from "./task-panel.js";
+
+/**
+ * Bound for the read-only session-header probe (first line only). Independent of
+ * pi's own ~1MiB session scan — we only need the header and keep the read small.
+ */
+const SESSION_HEADER_SCAN_BYTES = 64 * 1024;
+
+/**
+ * Read-only probe of a session JSONL file's project cwd from its header line.
+ * Does NOT call SessionManager.open() — that API creates directories, may rewrite
+ * empty/legacy files, and loads the full history. Used on session_shutdown for
+ * resume/fork destination checks. Unreadable / oversized / non-session files
+ * return undefined; callers decide fail-closed vs allow based on the shutdown reason.
+ */
+export function sessionFileCwd(sessionFile: string | undefined): string | undefined {
+  if (!sessionFile || !existsSync(sessionFile)) return undefined;
+  let fd: number | undefined;
+  try {
+    fd = openSync(sessionFile, "r");
+    const decoder = new StringDecoder("utf8");
+    const buffer = Buffer.allocUnsafe(4096);
+    const chunks: string[] = [];
+    let scanned = 0;
+    while (scanned < SESSION_HEADER_SCAN_BYTES) {
+      const n = readSync(fd, buffer, 0, Math.min(buffer.length, SESSION_HEADER_SCAN_BYTES - scanned), null);
+      if (n === 0) {
+        chunks.push(decoder.end());
+        break;
+      }
+      scanned += n;
+      const chunk = decoder.write(buffer.subarray(0, n));
+      const nl = chunk.indexOf("\n");
+      if (nl !== -1) {
+        chunks.push(chunk.slice(0, nl));
+        break;
+      }
+      chunks.push(chunk);
+    }
+    const line = chunks.join("").trim();
+    if (!line) return undefined;
+    const entry = JSON.parse(line) as { type?: string; cwd?: unknown };
+    if (entry.type !== "session" || typeof entry.cwd !== "string" || !entry.cwd) return undefined;
+    return resolve(entry.cwd);
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // ignore close errors on the probe fd
+      }
+    }
+  }
+}
+
+function buildManagerOptions(cwd: string, storage: WorkflowStorage) {
+  const settings = loadWorkflowSettings({ cwd });
+  return {
+    loadSavedWorkflow: (name: string) => storage.load(name)?.script,
+    toolsets: {
+      "web-research": () => [...createCodingTools(cwd), ...createBuiltinWebTools()],
+    },
+    excludeSubagentTools: settings.excludeSubagentTools,
+    providerMiddlewareExtensions: settings.providerMiddlewareExtensions,
+    defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
+    defaultTokenBudget: settings.defaultTokenBudget ?? null,
+    concurrency: settings.defaultConcurrency,
+    defaultAgentRetries: settings.defaultAgentRetries,
+    persistAgentSessions: settings.persistAgentSessions,
+    inheritMainModel: settings.inheritMainModel,
+  };
+}
+
+export default function extension(pi: ExtensionAPI) {
+  // Mutable host state. Tools/commands resolve through getters so a
+  // session_start that discovers a cross-project cwd can replace the manager
+  // without leaving closed-over references pointing at the source project.
+  //
+  // Factory-time cwd is process.cwd() only (Pi does not pass the host session
+  // cwd into the factory). The real session cwd arrives on session_start as
+  // ctx.cwd; if it differs we rebuild manager/storage against it and pause
+  // any foreign live runs that rode in via handoff.
+  let cwd = resolve(process.cwd());
+  let storage = createWorkflowStorage(cwd);
+  let managerOptions = buildManagerOptions(cwd, storage);
+
+  // Process-wide handoff slot (not cwd-keyed): the previous generation may have
+  // been bound to ctx.cwd while this factory only sees process.cwd(). Claim
+  // whatever is staged; session_start then keeps or rebuilds based on the true
+  // session project (manager.getCwd() vs ctx.cwd).
+  const runtimeClaim = claimWorkflowRuntime();
+  const previousRuntime = runtimeClaim.compatible;
+  let pausedForMismatch = runtimeClaim.versionMismatch ? pauseStrandedWorkflowRuntime(runtimeClaim.versionMismatch) : 0;
+
+  // Prefer the claimed manager's own project path for construction defaults
+  // when it already points at a real project (not just the launch dir).
+  if (previousRuntime) {
+    const claimedCwd = resolve(previousRuntime.manager.getCwd());
+    if (claimedCwd !== cwd) {
+      cwd = claimedCwd;
+      storage = createWorkflowStorage(cwd);
+      managerOptions = buildManagerOptions(cwd, storage);
+    }
+  }
+
+  let manager = previousRuntime?.manager ?? new WorkflowManager({ cwd, ...managerOptions });
+  if (previousRuntime) manager.reconfigureAfterReload(managerOptions);
+
+  // Stable effort object: /effort and keyword arming close over this reference.
+  // A handoff retains that same object and its user-selected in-memory level.
+  const handedOffEffort = (previousRuntime ?? runtimeClaim.versionMismatch)?.effort;
+  const effort: EffortState = handedOffEffort ?? createEffortState();
+  // A compatible runtime has already had a user-visible session. Keep its
+  // current in-memory choice rather than applying a setting again on reload.
+  let effortInitialized = handedOffEffort !== undefined;
+
+  const getManager = () => manager;
+  const getCwd = () => cwd;
+  const getStorage = () => storage;
+
+  // Install delivery listeners once. Delivery is fail-closed until
+  // session_start binds a per-session endpoint (no "latest pi wins"). Completions
+  // that race before bind leave a disk pending marker and flush on bind.
+  installResultDelivery(pi, manager, { loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }) });
+
+  const workflowTool = createWorkflowTool({
+    getManager,
+    getCwd,
+    getStorage,
+    get manager() {
+      return manager;
+    },
+    get cwd() {
+      return cwd;
+    },
+    get storage() {
+      return storage;
+    },
+  });
+  const workflowControlTool = createWorkflowControlTool({ getManager });
+  // `exposure: "deferred"` (pi >= 0.99) keeps both tools out of the declared
+  // tool set — and its prompt bytes out of the system prompt — until the
+  // built-in tool_search loads them. Older hosts never read the field, so the
+  // tools register active exactly as before; the session_start handler below
+  // force-activates them whenever no ACTIVE tool_search could discover them.
+  const DEFERRED_EXPOSURE = { exposure: "deferred" } as const;
+  pi.registerTool({ ...workflowTool, ...DEFERRED_EXPOSURE });
+  pi.registerTool({ ...workflowControlTool, ...DEFERRED_EXPOSURE });
+
+  // While a run is in flight the model may need to steer it: keep the control
+  // tool reachable without a tool_search round-trip. No-op once active (the
+  // common case — force-activated at session_start, or already loaded by a
+  // search). Best-effort: a host rejecting the loadout change must not break
+  // the run that emitted the event.
+  const activateControlToolOnRunStart = (target: WorkflowManager) => {
+    const ensureActive = () => {
+      try {
+        const current = pi.getActiveTools();
+        if (!current.includes(workflowControlTool.name)) {
+          pi.setActiveTools([...current, workflowControlTool.name]);
+        }
+      } catch {
+        // Host without a working active-tool set — the tool stays as registered.
+      }
+    };
+    target.on("started", ensureActive);
+    target.on("resumed", ensureActive);
+    return () => {
+      target.off("started", ensureActive);
+      target.off("resumed", ensureActive);
+    };
+  };
+  let disposeControlToolActivation = activateControlToolOnRunStart(manager);
+
+  let usageLimitScheduler = new UsageLimitScheduler(manager);
+  let disposeProgress: ReturnType<typeof installWorkflowProgress> | undefined;
+
+  pi.on("session_shutdown", (event?: { reason?: string; targetSessionFile?: string }) => {
+    // These listeners own this generation's host. Detach before a manager can
+    // be handed off or paused, so late events cannot mutate the outgoing host.
+    disposeControlToolActivation();
+    usageLimitScheduler.dispose();
+    // Always stop live sends first so a completion racing teardown cannot
+    // deliver into the outgoing session (or throw on a just-stale ctx and be
+    // lost). Replacement reasons stage the runtime for the next generation
+    // only when the destination is the same project; quit/unknown/cross-project
+    // pause in-flight runs onto the journal path.
+    const outgoingSessionId = manager.getSessionId?.();
+    suspendResultDelivery(manager);
+
+    const reason = event?.reason;
+    const runtime: WorkflowReloadRuntime = {
+      cwd,
+      extensionVersion: WORKFLOW_EXTENSION_VERSION,
+      manager,
+      effort,
+    };
+
+    let canHandoff = !!reason && SESSION_REPLACEMENT_REASONS.has(reason);
+    if (reason === "resume" || reason === "fork") {
+      const targetCwd = sessionFileCwd(event?.targetSessionFile);
+      // Resume requires a same-project header. A fork's new file may not yet
+      // exist; only a positively different project prevents its handoff.
+      canHandoff = reason === "resume" ? targetCwd === cwd : !targetCwd || targetCwd === cwd;
+    }
+    if (canHandoff) {
+      disposeProgress?.("handoff");
+      disposeProgress = undefined;
+      handoffWorkflowRuntime(runtime);
+      return;
+    }
+
+    pauseStrandedWorkflowRuntime(runtime);
+    disposeProgress?.("shutdown");
+    disposeProgress = undefined;
+    discardWorkflowRuntime(cwd, runtime);
+    dropSessionDelivery(outgoingSessionId);
+  });
+
+  registerWorkflowCommands(pi, getManager, {
+    getStorage,
+    getCwd,
+    effort,
+  });
+  registerWorkflowModelsCommand(pi);
+  registerBuiltinWorkflows(pi, { getManager, getCwd, getStorage });
+  // Saved project commands are registered on session_start (after the real
+  // ctx.cwd is known and any cross-project rebuild has finished). Registering
+  // them in the factory would stamp source-project descriptions onto slash
+  // commands before a resume into another project could correct the cwd —
+  // and Pi cannot unregister/replace a command's metadata once registered.
+  registerEffortCommand(pi, effort);
+
+  let armingInstalled = false;
+
+  pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
+    disposeProgress?.();
+    disposeProgress = undefined;
+    // True project cwd for this session. Pi keeps process.cwd() on the
+    // launching directory across /resume into another project; ctx.cwd is
+    // the session header's project path.
+    const sessionCwd = resolve(ctx.cwd || process.cwd());
+
+    if (sessionCwd !== resolve(manager.getCwd())) {
+      // Cross-project: the live manager is for the wrong tree. Pause anything
+      // still on it, then rebuild against the real session project.
+      disposeControlToolActivation();
+      const stranded: WorkflowReloadRuntime = {
+        cwd: manager.getCwd(),
+        extensionVersion: WORKFLOW_EXTENSION_VERSION,
+        manager,
+        effort,
+      };
+      const n = pauseStrandedWorkflowRuntime(stranded);
+      if (n > 0) pausedForMismatch += n;
+
+      cwd = sessionCwd;
+      storage = createWorkflowStorage(cwd);
+      managerOptions = buildManagerOptions(cwd, storage);
+      manager = new WorkflowManager({ cwd, ...managerOptions });
+      installResultDelivery(pi, manager, { loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }) });
+      disposeControlToolActivation = activateControlToolOnRunStart(manager);
+      usageLimitScheduler.dispose();
+      usageLimitScheduler = new UsageLimitScheduler(manager);
+    } else if (cwd !== sessionCwd) {
+      // Manager already owns the session project; just align the local cwd/storage.
+      cwd = sessionCwd;
+      storage = createWorkflowStorage(cwd);
+      managerOptions = buildManagerOptions(cwd, storage);
+      manager.reconfigureAfterReload(managerOptions);
+    }
+
+    // Factory-time process.cwd() can be the launch directory after /resume.
+    // Initialize only once, after ctx.cwd has selected the actual project, so
+    // the project overlay is applied without overwriting /effort changes on a
+    // later session_start or a compatible runtime handoff.
+    if (!effortInitialized) {
+      effort.level = loadWorkflowSettings({ cwd: sessionCwd }).defaultEffort ?? "off";
+      effortInitialized = true;
+    }
+
+    // First registration (and post-rebuild catch-up for target-only names).
+    // Handlers load by name from the live storage, so a later same-session
+    // overwrite picks up the new script; Pi still cannot drop source-only
+    // names left over from a prior generation — those handlers notify.
+    registerAllSavedWorkflows(pi, getCwd, getStorage, getManager);
+
+    if (pausedForMismatch > 0) {
+      ctx.ui.notify(
+        `Paused ${pausedForMismatch} active workflow(s) that could not safely continue in this session (extension update or project switch). Resume them from /workflows when ready.`,
+        "warning",
+      );
+      pausedForMismatch = 0;
+    }
+
+    manager.setMainModel(ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+    manager.setModelRegistry(ctx.modelRegistry);
+
+    const active = pi.getActiveTools();
+    const workflowTools = [workflowTool.name, workflowControlTool.name];
+    // An ACTIVE tool_search (pi >= 0.99) can discover the deferred tools on
+    // demand — leave them undeclared and keep the prompt relief. Without one
+    // nothing could ever reach them, so force-activate as before. The name is
+    // hardcoded: the floor pi version's types do not export it.
+    const TOOL_SEARCH_TOOL_NAME = "tool_search";
+    if (!active.includes(TOOL_SEARCH_TOOL_NAME)) {
+      const missing = workflowTools.filter((name) => !active.includes(name));
+      if (missing.length) pi.setActiveTools([...active, ...missing]);
+    }
+
+    // Bind + adopt before binding delivery so a flushed completion is tagged
+    // with this session and visible in its panel. Capture the previous id first
+    // so completed-with-pending can be re-homed across /new / fork / switch.
+    let sessionId: string | undefined;
+    let sessionFile: string | undefined;
+    try {
+      sessionId = ctx.sessionManager?.getSessionId();
+    } catch {
+      // sessionManager may be unavailable — fall back to global history.
+    }
+    try {
+      sessionFile = ctx.sessionManager?.getSessionFile();
+    } catch {
+      // An ephemeral or unavailable session has no parent file.
+    }
+    const previousSessionId = manager.getSessionId();
+    manager.adoptLiveRunsToSession(sessionId, previousSessionId);
+    manager.setSessionId(sessionId, sessionFile);
+    if (ctx.mode === "rpc" && sessionId) {
+      disposeProgress = installWorkflowProgress(pi, manager, sessionId);
+    }
+
+    // Runtime is bound now (session_start fires after bindCore). Register a
+    // session-stable delivery endpoint for THIS session only, then flush any
+    // disk/memory pending for this sessionId (parallel siblings never share it).
+    if (sessionId) {
+      bindSessionDelivery(sessionId, pi, {
+        loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }),
+        reportWarning: (message) => ctx.ui.notify(message, "warning"),
+        manager,
+        sessionManager: ctx.sessionManager,
+      });
+      if (previousSessionId && previousSessionId !== sessionId) {
+        dropSessionDelivery(previousSessionId);
+      }
+    }
+
+    installTaskPanel(pi, manager, ctx.ui, {
+      storage,
+      cwd,
+      loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }),
+    });
+    if (!armingInstalled) {
+      installWorkflowKeywordArming(pi, effort, {
+        settingsStore: {
+          load: () => loadWorkflowSettings({ cwd: getCwd() }),
+          save: (nextSettings) => saveWorkflowSettingsForCwd(nextSettings, getCwd()),
+        },
+      });
+      armingInstalled = true;
+    }
+  });
+
+  // Keep mainModel in sync with mid-session /model (and cycle/restore). Without
+  // this, workflow subagents that fall through to mainModel keep the frozen
+  // session_start value for the rest of the process lifetime.
+  pi.on("model_select", (event) => {
+    const m = event.model;
+    manager.setMainModel(m ? `${m.provider}/${m.id}` : undefined);
+  });
+}

@@ -15,7 +15,7 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
+import { parseWorkflowScript, type WorkflowResumeMode, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
@@ -23,6 +23,28 @@ import { loadWorkflowSettings } from "./workflow-settings.js";
 /** The single always-on gate that authorizes workflow use without forcing it. */
 export const WORKFLOW_GATE_GUIDELINE =
   "The `workflow` tool runs multi-agent orchestration — it fans decomposable work out across subagents, and fits tasks shaped like: repo-wide inspection, independent parallel research/checks, multi-perspective review, or fan-out/fan-in synthesis. ONLY call it when the user explicitly opts in — via the workflow trigger word, `/workflows run`, or their own words (e.g. 'run a workflow', 'fan this out', '并行审一遍'). For any other task — even one that would clearly benefit — do not call it; you may briefly offer it (with a rough cost) as an option instead.";
+
+/**
+ * What a codemode script receives when it calls the workflow tool (see the
+ * outputSchema spread below): started/resumed runs deliver their result back
+ * into the conversation later; only a synchronous (background: false) call
+ * resolves with `result` present.
+ */
+const workflowOutputSchema = Type.Object({
+  runId: Type.String(),
+  status: Type.Union([Type.Literal("started"), Type.Literal("resumed"), Type.Literal("completed")]),
+  result: Type.Optional(Type.Unknown()),
+});
+
+/**
+ * Attach structuredContent outside the result literals: the floor pi types do
+ * not declare the field (added upstream with outputSchema), so a literal
+ * property would fail the excess-property check. The model-facing `content`
+ * is untouched — only tool-chaining callers (codemode) read this.
+ */
+function withStructuredContent<T extends object>(result: T, structuredContent: unknown): T {
+  return Object.assign(result, { structuredContent });
+}
 
 const workflowToolSchema = Type.Object({
   script: Type.Optional(
@@ -108,9 +130,15 @@ const workflowToolSchema = Type.Object({
     Type.String({
       description: [
         "Resume a prior run (this ID) with an edited `script` instead of starting a new run.",
-        "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs.",
+        "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs (see resumeMode).",
         "Calls match by position: keep earlier good calls identical and in order. Always background.",
       ].join(" "),
+    }),
+  ),
+  resumeMode: Type.Optional(
+    Type.Union([Type.Literal("prefix"), Type.Literal("replay-completed")], {
+      description:
+        "Replay policy with resumeFromRunId. prefix (default): the first changed/new/never-completed call onward re-runs. replay-completed: completed calls also replay across a never-completed gap when dispatched concurrently with it in one fan-out (paused fan-out); calls made after an await (workflow() children included) are sequential and still re-run — a workflow() call in the gap's own window keeps its child journal; a changed call still re-runs its suffix. The choice persists on the run: later resumes keep it unless overridden. Store/file-passed results are not hash-checked and can replay stale across a gap.",
     }),
   ),
 });
@@ -126,6 +154,7 @@ export type WorkflowToolInput = {
   agentTimeoutMs?: number;
   tokenBudget?: number;
   resumeFromRunId?: string;
+  resumeMode?: WorkflowResumeMode;
 };
 
 export interface WorkflowToolOptions {
@@ -157,16 +186,27 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
   const fallbackCwd = options.cwd ?? process.cwd();
   const fallbackStorage = options.storage ?? createWorkflowStorage(fallbackCwd);
   const defaults = resolveWorkflowToolDefaults(options, fallbackCwd);
-  const fallbackManager =
-    options.manager ??
-    new WorkflowManager({
-      cwd: options.cwd,
-      concurrency: defaults.concurrency,
-      loadSavedWorkflow: (name: string) => fallbackStorage.load(name)?.script,
-      defaultAgentTimeoutMs: defaults.agentTimeoutMs,
-      defaultAgentRetries: defaults.agentRetries,
-    });
-  const getManager = () => options.getManager?.() ?? fallbackManager;
+  // Lazy (audit2 #38): WorkflowManager's constructor scans — and on stale-run
+  // recovery, REWRITES — the cwd's run store. Callers that only need the
+  // tool's schema/description (context measurement, release gate) must not
+  // touch the developer's real global store as a side effect.
+  let fallbackManager: WorkflowManager | undefined;
+  const getManager = () => {
+    const provided = options.getManager?.() ?? options.manager;
+    if (provided) return provided;
+    if (!fallbackManager) {
+      fallbackManager = new WorkflowManager({
+        // Bind to the factory-time cwd, not a re-read of process.cwd() at
+        // execute time (r1 NIT: split-brain with fallbackStorage).
+        cwd: options.cwd ?? fallbackCwd,
+        concurrency: defaults.concurrency,
+        loadSavedWorkflow: (name: string) => fallbackStorage.load(name)?.script,
+        defaultAgentTimeoutMs: defaults.agentTimeoutMs,
+        defaultAgentRetries: defaults.agentRetries,
+      });
+    }
+    return fallbackManager;
+  };
   const getStorage = () => options.getStorage?.() ?? fallbackStorage;
   const getCwd = () => options.getCwd?.() ?? fallbackCwd;
 
@@ -181,6 +221,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return [WORKFLOW_GATE_GUIDELINE];
     },
     parameters: workflowToolSchema,
+    // Codemode (pi >= 0.99, including the 1.x line) resolves a called tool to
+    // its structuredContent when the declaration carries an outputSchema;
+    // tools without one resolve to prose text. The provider-visible
+    // declaration picks only name/description/parameters, so this costs no
+    // prompt bytes, and hosts without the feature ignore the field. The floor
+    // pi types predate it — spread bypasses the excess-property check.
+    ...{ outputSchema: workflowOutputSchema },
     prepareArguments(args) {
       return normalizeWorkflowToolArgs(args);
     },
@@ -224,6 +271,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       // replay from the prior run's journal; the first edited/new call and
       // everything after it re-run live. Always background (the resumed run is
       // detached and its result is delivered back into the conversation).
+      if (params.resumeMode !== undefined && !params.resumeFromRunId) {
+        throw new Error("workflow: `resumeMode` only applies together with `resumeFromRunId`.");
+      }
       if (params.resumeFromRunId) {
         const runId = params.resumeFromRunId;
         const resumed = await manager.resume(runId, {
@@ -232,14 +282,27 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           // Explicit raise only — resume keeps the start-time cap unless the
           // caller passes a higher maxAgents (see WorkflowManager.resume, #146).
           maxAgents: params.maxAgents,
+          resumeMode: params.resumeMode,
         });
         if (!resumed) {
           throw new Error(resumeFailureText(manager, runId, params.maxAgents));
         }
-        return {
-          content: [{ type: "text", text: resumedText(parsed.meta.name, runId) }],
-          details: { runId, background: true, resumedFrom: runId },
-        };
+        return withStructuredContent(
+          {
+            content: [
+              {
+                type: "text",
+                // The EFFECTIVE policy decides the replay description: an omitted
+                // resumeMode falls back to the run's persisted mode (see
+                // WorkflowManager.resume), so params.resumeMode alone can
+                // misdescribe what the resumed run will actually do.
+                text: resumedText(parsed.meta.name, runId, manager.getRun(runId)?.resumeMode ?? params.resumeMode),
+              },
+            ],
+            details: { runId, background: true, resumedFrom: runId },
+          },
+          { runId, status: "resumed" },
+        );
       }
 
       // checkpoint() reaches the human only on a UI-bearing foreground run; a
@@ -267,10 +330,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           tools: invocationTools,
           toolset: invocationToolset,
         });
-        return {
-          content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
-          details: { runId, background: true },
-        };
+        return withStructuredContent(
+          {
+            content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
+            details: { runId, background: true },
+          },
+          { runId, status: "started" },
+        );
       }
 
       // Synchronous execution (blocking) — but routed through the manager so the
@@ -285,6 +351,20 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         showResultPreviews: false,
       });
 
+      // Coalesced progress rendering state (see onProgress below).
+      let latestProgress: WorkflowSnapshot | undefined;
+      let progressRenderTimer: ReturnType<typeof setTimeout> | undefined;
+      const flushProgress = () => {
+        if (progressRenderTimer) {
+          clearTimeout(progressRenderTimer);
+          progressRenderTimer = undefined;
+          if (latestProgress) {
+            snapshot = recomputeWorkflowSnapshot(latestProgress);
+            display.update(snapshot); // the last frame must not be 100ms stale
+          }
+        }
+      };
+
       let result: WorkflowRunResult;
       try {
         result = await manager.runSync(script, params.args, {
@@ -298,11 +378,23 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           confirm,
           externalSignal: signal,
           onProgress(live) {
-            snapshot = recomputeWorkflowSnapshot(live);
-            display.update(snapshot);
+            // Trailing-edge coalescing (audit2 #24): with many concurrent
+            // agents, progress events fire hundreds of times per second and a
+            // full recompute+render each time stalls the host event loop.
+            latestProgress = live;
+            if (!progressRenderTimer) {
+              progressRenderTimer = setTimeout(() => {
+                progressRenderTimer = undefined;
+                if (latestProgress) {
+                  snapshot = recomputeWorkflowSnapshot(latestProgress);
+                  display.update(snapshot);
+                }
+              }, 100);
+            }
           },
         });
       } catch (error) {
+        flushProgress();
         if (signal?.aborted || (error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED)) {
           for (const agent of snapshot.agents) {
             if (agent.status === "running") {
@@ -317,12 +409,14 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         throw error;
       }
 
+      flushProgress(); // no stray timer may survive ANY exit, incl. this throw
       if (result.agentCount === 0) {
         throw new Error(
           "workflow scripts must call agent() at least once; this workflow declared phases but did not run any subagents",
         );
       }
 
+      flushProgress();
       snapshot.result = result.result;
       snapshot.durationMs = result.durationMs;
       snapshot = recomputeWorkflowSnapshot(snapshot);
@@ -337,32 +431,45 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       const formattedResult =
         result.result !== undefined ? `\n\`\`\`json\n${JSON.stringify(result.result, null, 2)}\n\`\`\`` : "";
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}\n\n${reviseHint(result.runId)}`,
+      const warningInfo = result.warnings?.length ? `\n\n${result.warnings.join("\n\n")}` : "";
+
+      return withStructuredContent(
+        {
+          content: [
+            {
+              type: "text",
+              text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}${warningInfo}\n\n${reviseHint(result.runId)}`,
+            },
+          ],
+          details: {
+            ...snapshot,
+            meta: result.meta,
+            phases: result.phases,
+            logs: result.logs,
+            result: result.result,
+            warnings: result.warnings,
+            durationMs: result.durationMs,
+            tokenUsage: result.tokenUsage,
+            runId: result.runId,
           },
-        ],
-        details: {
-          ...snapshot,
-          meta: result.meta,
-          phases: result.phases,
-          logs: result.logs,
-          result: result.result,
-          durationMs: result.durationMs,
-          tokenUsage: result.tokenUsage,
-          runId: result.runId,
         },
-      };
+        {
+          runId: result.runId,
+          status: "completed",
+          ...(result.result === undefined ? {} : { result: result.result }),
+        },
+      );
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("workflow")), 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
-      const snapshot = result.details as WorkflowSnapshot | undefined;
+      const snapshot = result.details as (WorkflowSnapshot & { warnings?: string[] }) | undefined;
       if (snapshot?.name) {
-        return new Text(renderWorkflowText(snapshot, !isPartial), 0, 0);
+        // Completion diagnostics (e.g. every agent's error in an all-failed fleet)
+        // exist only on the finished result; the agent tree alone shows just a count.
+        const warnings = !isPartial && snapshot.warnings?.length ? `\n\n${snapshot.warnings.join("\n\n")}` : "";
+        return new Text(`${renderWorkflowText(snapshot, !isPartial)}${warnings}`, 0, 0);
       }
       // Fallback: strip markdown syntax so the TUI doesn't display raw asterisks/hashes.
       // The `content` field is for the LLM (where markdown is preserved), but the TUI
@@ -423,18 +530,31 @@ export function backgroundStartedText(name: string, runId: string): string {
  */
 export function reviseHint(runId: string | undefined): string {
   if (!runId) return "";
-  return `To revise without re-running everything: re-call workflow with resumeFromRunId="${runId}" and an edited script — unchanged agent() calls replay from cache, only edited/new ones re-run.`;
+  return `To revise without re-running everything: re-call workflow with resumeFromRunId="${runId}" and an edited script — unchanged agent() calls replay from cache, only edited/new ones re-run. For a run paused inside a fan-out, add resumeMode="replay-completed" to also replay completed fan-out siblings across the never-completed gap.`;
 }
 
 /**
  * The tool result returned when the model resumes a run with an edited script.
  * The resumed run is always background, so its result is delivered back later.
+ * The replay lines describe the policy actually chosen via resumeMode.
  */
-export function resumedText(name: string, runId: string): string {
+export function resumedText(name: string, runId: string, resumeMode?: WorkflowResumeMode): string {
+  const replay =
+    resumeMode === "replay-completed"
+      ? [
+          "Unchanged completed agent() calls replay from that run's journal (cache) — including",
+          "completed fan-out siblings across a never-completed gap; the gap still re-runs its",
+          "sequential downstream (calls after an await — workflow() children included, though",
+          "one dispatched in the gap's own window replays with its child journal), and the",
+          "first edited call — and everything after it — re-runs live.",
+        ]
+      : [
+          "Unchanged agent() calls replay from that run's journal (cache); the first",
+          "changed, new, or never-completed agent() call — and everything after it — re-runs live.",
+        ];
   return [
     `Workflow "${name}" resumed from run ${runId} with your edited script.`,
-    "Unchanged agent() calls replay from that run's journal (cache); the first",
-    "edited or newly inserted agent() call — and everything after it — re-runs live.",
+    ...replay,
     "It runs in the background; the result is delivered back here when it finishes,",
     "and the conversation continues automatically. The user can wait or keep working.",
     `Track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,

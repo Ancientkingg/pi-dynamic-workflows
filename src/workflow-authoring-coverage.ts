@@ -33,11 +33,11 @@ export const WORKFLOW_COMPREHENSION_SCENARIO_IDS = COMPREHENSION_SCENARIOS.map((
 export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   {
     path: "skills/workflow-authoring/SKILL.md",
-    sha256: "7571c9a3d44908b65ef927a208e364395d6379ed66dbfdd8886c900a30612981",
+    sha256: "6f166eef4ced63ace67eda84e826a58756d88ad539961e3c5dd2e81dbe3a809a",
   },
   {
     path: "skills/workflow-authoring/references/runtime.md",
-    sha256: "5eb9d6f9b7f5403f84cdb2f9e06a0926d87b6292eb01ce5e4ae533393c0b173f",
+    sha256: "a602af4fc6ebfeeab7ab9e089968864226bd37c85789f08508c73655595f1988",
   },
   {
     path: "skills/workflow-authoring/references/helpers.md",
@@ -45,11 +45,11 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/specialized-helpers.md",
-    sha256: "8cf78fe0285fecd65e1a80626f29ff8c3b4977f65c7370cc1d3511ff6eda4305",
+    sha256: "ef95cc7fb9c68e55cb64cc7f63814df4059dbffa6c3d06f63f13d21819c4b863",
   },
   {
     path: "skills/workflow-authoring/references/lifecycle.md",
-    sha256: "9e1fddeb53bca20b245c3109d93f9f5cef957e5f196790652c3f35c9f0e56bfe",
+    sha256: "15c93eae6e2da24c160b5080b7bb8c7ab7de50b7b8cc9a80f9f02e58f601acec",
   },
   {
     path: "skills/workflow-authoring/references/pattern-selection.md",
@@ -61,7 +61,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/registry-ownership.md",
-    sha256: "425babf6fa5bd24fa0adef3d9b398661ad1e933d372b3989d22fe99e63f2c7ba",
+    sha256: "1fcff2bc3077efa58e6ed4e21c84d40bdb83ed49470f455d8753d3ae5d5c28e7",
   },
   {
     path: "skills/workflow-authoring/references/review.md",
@@ -162,6 +162,11 @@ const FROZEN_GUIDANCE_BY_CAPABILITY: Readonly<Record<string, readonly ProtectedG
     },
   ],
   "workflow.runtime.checkpoint": [
+    {
+      path: SPECIALIZED_HELPERS_PATH,
+      requiredText:
+        "`checkpoint({ kind, checkpointId, payload })` | Durably suspends the run until a controller attaches a JSON response for that exact ID and resumes it. Works without foreground UI; replay returns the journaled response.",
+    },
     {
       path: SPECIALIZED_HELPERS_PATH,
       requiredText:

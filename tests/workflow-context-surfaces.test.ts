@@ -120,11 +120,10 @@ async function withRenderedWorkflow(
   }) => Promise<void>,
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "workflow-context-measurement-"));
-  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 
   try {
-    process.env.PI_CODING_AGENT_DIR = root;
     await withFakeHomeAsync(root, async () => {
+      process.env.PI_CODING_AGENT_DIR = root;
       const workflow = createWorkflowTool({ cwd: root });
       const loader = new DefaultResourceLoader({
         cwd: root,
@@ -147,7 +146,7 @@ async function withRenderedWorkflow(
         const wrappedWorkflow = session.agent.state.tools.find((tool) => tool.name === "workflow");
         assert.ok(wrappedWorkflow, "Pi should expose the wrapped workflow tool");
         await inspect({
-          systemPrompt: session.agent.state.systemPrompt,
+          systemPrompt: session.systemPrompt,
           promptLines: [
             `- workflow: ${workflow.promptSnippet}`,
             ...(workflow.promptGuidelines ?? []).map((guideline) => `- ${guideline}`),
@@ -159,8 +158,6 @@ async function withRenderedWorkflow(
       }
     });
   } finally {
-    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     await rm(root, { recursive: true, force: true });
   }
 }

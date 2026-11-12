@@ -13,15 +13,49 @@ import { Type } from "typebox";
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
 
+/** Read cap for fetched pages (audit2 #42): htmlToText runs ~10 regex passes
+ * over whatever we buffer — an unbounded multi-MB body stalls the host event
+ * loop on every agent's progress pipeline. 2MB is far above any documentation
+ * page's readable content. */
+const MAX_FETCH_BODY_BYTES = 2 * 1024 * 1024;
+
 async function fetchText(url: string, timeoutMs = 15000): Promise<{ status: number; body: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, { headers: { "user-agent": UA }, signal: controller.signal, redirect: "follow" });
-    return { status: res.status, body: await res.text() };
+    return { status: res.status, body: await readBodyCapped(res) };
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Read the response body, stopping at MAX_FETCH_BODY_BYTES. */
+export async function readBodyCapped(res: Response): Promise<string> {
+  if (!res.body) return res.text();
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      chunks.push(value);
+      if (total >= MAX_FETCH_BODY_BYTES) break;
+    }
+  } finally {
+    if (total >= MAX_FETCH_BODY_BYTES) await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  const merged = new Uint8Array(Math.min(total, MAX_FETCH_BODY_BYTES));
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk.subarray(0, merged.length - offset), offset);
+    offset += Math.min(chunk.byteLength, merged.length - offset);
+    if (offset >= merged.length) break;
+  }
+  return new TextDecoder().decode(merged);
 }
 
 export function htmlToText(html: string): string {
@@ -121,4 +155,28 @@ export function createWebFetchTool(maxChars = 6000): ToolDefinition {
 /** Both web tools, for injecting into a research workflow's agents. */
 export function createWebTools(): ToolDefinition[] {
   return [createWebSearchTool(), createWebFetchTool()];
+}
+
+// A definition marker, not a registry: independent module evaluations must
+// recognize the same built-in defaults without retaining tools or sessions.
+const BUILTIN_WEB_FALLBACK = Symbol.for("@quintinshaw/pi-dynamic-workflows/builtin-web-fallback");
+
+/** Built-in research defaults yield to explicitly loaded child extension tools. */
+export function createBuiltinWebTools(): ToolDefinition[] {
+  return createWebTools().map((tool) => {
+    Object.defineProperty(tool, BUILTIN_WEB_FALLBACK, { value: true });
+    return tool;
+  });
+}
+
+/** Explicit SDK tools keep normal precedence; only marked defaults may yield. */
+export function resolveBuiltinWebFallbacks(
+  tools: ToolDefinition[],
+  extensionToolNames: ReadonlySet<string>,
+): ToolDefinition[] {
+  return tools.filter(
+    (tool) =>
+      !extensionToolNames.has(tool.name) ||
+      !(tool as ToolDefinition & { [BUILTIN_WEB_FALLBACK]?: boolean })[BUILTIN_WEB_FALLBACK],
+  );
 }

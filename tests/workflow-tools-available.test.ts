@@ -2,7 +2,7 @@
  * Tests for tools availability when workflows mode is triggered.
  *
  * The bug: when a user message contains "workflow" (trigger keyword),
- * installWorkflowKeywordArming's input handler calls:
+ * installWorkflowKeywordArming's arming path calls:
  *   pi.setActiveTools?.([WORKFLOW_TOOL_NAME]);
  * which restricts ALL tools to ONLY the workflow tool.
  * The model then cannot use read, bash, edit, write, web_search, etc.
@@ -10,7 +10,7 @@
  *
  * The fix: preserve default Pi tools alongside the workflow tool.
  * These tests verify that default tools remain available after the
- * workflows-mode trigger fires.
+ * workflows-mode trigger fires, while the user message remains unchanged.
  */
 
 import assert from "node:assert/strict";
@@ -18,15 +18,19 @@ import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it, mock } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   claimWorkflowRuntime,
   discardWorkflowRuntime,
   handoffWorkflowRuntime,
   takeWorkflowRuntime,
+  WORKFLOW_EXTENSION_VERSION,
 } from "../src/extension-reload.js";
 import { _registerBoundSessionSendForTests, _resetDeliveryRegistriesForTests } from "../src/task-panel.js";
-import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
+import { buildArmedWorkflowDirective, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
+import { WorkflowManager } from "../src/workflow-manager.js";
+import type { WorkflowProgress } from "../src/workflow-progress.js";
+import { saveWorkflowSettings } from "../src/workflow-settings.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // ---------------------------------------------------------------------------
@@ -76,6 +80,47 @@ function createMockPi(initialTools: string[] = [...DEFAULT_PI_TOOLS]): MockPi {
   };
 }
 
+function createDeferredHost() {
+  const tools: Array<{ name: string; execute: (...args: any[]) => any }> = [];
+  const activeTools = ["bash", "read", "tool_search"];
+  const setCalls: string[][] = [];
+  const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+  const pi = {
+    registerTool: (tool: { name: string; execute: (...args: any[]) => any }) => tools.push(tool),
+    registerCommand: () => {},
+    getCommands: () => [],
+    on: (event: string, handler: (...args: any[]) => any) => {
+      if (!handlers[event]) handlers[event] = [];
+      handlers[event].push(handler);
+    },
+    getActiveTools: () => [...activeTools],
+    setActiveTools: (tools: string[]) => {
+      setCalls.push([...tools]);
+      activeTools.splice(0, activeTools.length, ...tools);
+    },
+    sendMessage: () => {},
+  } as unknown as ExtensionAPI;
+  return {
+    pi,
+    tools,
+    activeTools,
+    setCalls,
+    resetTools: () => activeTools.splice(0, activeTools.length, "bash", "read", "tool_search"),
+    start: (cwd: string) =>
+      handlers.session_start[0](
+        {},
+        {
+          cwd,
+          model: undefined,
+          modelRegistry: {},
+          sessionManager: { getSessionId: () => "session-deferred-lifecycle" },
+          ui: { setWidget: () => {}, notify: () => {} },
+        },
+      ),
+    shutdown: (reason: string) => handlers.session_shutdown[0]({ reason }),
+  };
+}
+
 function testSettingsOptions(keywordTriggerEnabled = true, keywordTriggerWord?: string) {
   return {
     settingsStore: {
@@ -102,16 +147,20 @@ describe("installWorkflowKeywordArming - tool availability", () => {
     assert.ok(inputHandlers, "input handler should be registered");
     assert.equal(inputHandlers.length, 1);
 
-    const result = inputHandlers[0]({
-      source: "interactive",
-      text: "przetestuj to workflow zadanie",
-    });
+    const prompt = "przetestuj to workflow zadanie";
+    const result = inputHandlers[0]({ source: "interactive", text: prompt }, { hasUI: true });
 
-    // Verify transform result
-    assert.deepEqual(result, {
-      action: "transform",
-      text: buildArmedWorkflowPrompt("przetestuj to workflow zadanie"),
-    });
+    // Keyword input remains unchanged; its directive is injected into the
+    // matching agent turn's system prompt.
+    assert.deepEqual(result, { action: "continue" });
+    const beforeHandlers = mockPi.handlers.before_agent_start;
+    assert.ok(beforeHandlers, "before_agent_start handler should be registered");
+    const beforeResult = beforeHandlers[0]({ prompt, systemPrompt: "BASE" });
+    assert.equal(
+      beforeResult.systemPrompt,
+      `BASE\n\n${buildArmedWorkflowDirective()}`,
+      "keyword directive should be transient system-prompt state",
+    );
 
     // Verify getActiveTools was called
     assert.equal(mockPi.getActiveTools.mock.callCount(), 1);
@@ -151,10 +200,13 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     // Trigger input with "workflows"
     const inputHandlers = mockPi.handlers.input;
-    inputHandlers[0]({
-      source: "interactive",
-      text: "run workflows",
-    });
+    inputHandlers[0](
+      {
+        source: "interactive",
+        text: "run workflows",
+      },
+      { hasUI: true },
+    );
 
     // Verify tools were set (with default tools preserved)
     const toolsWhenActive = mockPi.setActiveTools.mock.calls[0].arguments[0];
@@ -185,11 +237,13 @@ describe("installWorkflowKeywordArming - tool availability", () => {
     );
 
     const inputHandlers = mockPi.handlers.input;
-    assert.deepEqual(inputHandlers[0]({ source: "interactive", text: "run workflow" }), { action: "continue" });
+    assert.deepEqual(inputHandlers[0]({ source: "interactive", text: "run workflow" }, { hasUI: true }), {
+      action: "continue",
+    });
     assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
 
-    const result = inputHandlers[0]({ source: "interactive", text: "run pi-workflow" });
-    assert.equal(result.action, "transform");
+    const result = inputHandlers[0]({ source: "interactive", text: "run pi-workflow" }, { hasUI: true });
+    assert.equal(result.action, "continue");
     assert.equal(mockPi.setActiveTools.mock.callCount(), 1);
   });
 
@@ -202,10 +256,13 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     // Simulate user submitting a slash command
     const inputHandlers = mockPi.handlers.input;
-    const result = inputHandlers[0]({
-      source: "interactive",
-      text: "/workflows list",
-    });
+    const result = inputHandlers[0](
+      {
+        source: "interactive",
+        text: "/workflows list",
+      },
+      { hasUI: true },
+    );
 
     // Should not transform (slash commands are not triggers)
     assert.deepEqual(result, { action: "continue" });
@@ -259,10 +316,13 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     const inputHandlers = mockPi.handlers.input;
     assert.doesNotThrow(() => {
-      inputHandlers[0]({
-        source: "interactive",
-        text: "test workflow",
-      });
+      inputHandlers[0](
+        {
+          source: "interactive",
+          text: "test workflow",
+        },
+        { hasUI: true },
+      );
     });
   });
 
@@ -278,13 +338,17 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     const inputHandlers = mockPi.handlers.input;
     // Should not throw — the catch block handles it
-    const result = inputHandlers[0]({
-      source: "interactive",
-      text: "test workflow",
-    });
+    const result = inputHandlers[0](
+      {
+        source: "interactive",
+        text: "test workflow",
+      },
+      { hasUI: true },
+    );
 
-    // Should still return the transform action even if setActiveTools failed
-    assert.equal(result.action, "transform");
+    // The input remains unchanged even if setActiveTools failed; the
+    // transient directive is still staged for before_agent_start.
+    assert.equal(result.action, "continue");
   });
 
   it("should handle multiple trigger events and restore correctly", async () => {
@@ -297,16 +361,22 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     // First trigger
     const inputHandlers = mockPi.handlers.input;
-    inputHandlers[0]({
-      source: "interactive",
-      text: "test workflow 1",
-    });
+    inputHandlers[0](
+      {
+        source: "interactive",
+        text: "test workflow 1",
+      },
+      { hasUI: true },
+    );
 
     // Second trigger (before turn_end)
-    inputHandlers[0]({
-      source: "interactive",
-      text: "test workflow 2",
-    });
+    inputHandlers[0](
+      {
+        source: "interactive",
+        text: "test workflow 2",
+      },
+      { hasUI: true },
+    );
 
     // setActiveTools should only have been called once (savedTools is already set)
     assert.equal(mockPi.setActiveTools.mock.callCount(), 1);
@@ -331,10 +401,13 @@ describe("installWorkflowKeywordArming - tool availability", () => {
       mockPi.setActiveTools.mock.resetCalls();
 
       const inputHandlers = mockPi.handlers.input;
-      inputHandlers[0]({
-        source: "interactive",
-        text: `run ${keyword} test`,
-      });
+      inputHandlers[0](
+        {
+          source: "interactive",
+          text: `run ${keyword} test`,
+        },
+        { hasUI: true },
+      );
 
       const tools = mockPi.setActiveTools.mock.calls[0]?.arguments[0];
       assert.ok(tools?.includes("bash"), `bash should be available for keyword "${keyword}"`);
@@ -360,11 +433,273 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 });
 
 describe("workflow extension - control tool availability", () => {
+  function progressSession(install: (pi: ExtensionAPI) => void, cwd: string, sessionFile?: string) {
+    let session = sessionFile ? SessionManager.open(sessionFile) : SessionManager.create(cwd, join(cwd, "sessions"));
+    const file = session.getSessionFile();
+    assert.ok(file);
+    if (!sessionFile) {
+      // Open a persisted native session so custom entries are written even
+      // before an assistant turn (a new Pi session normally defers that write).
+      writeFileSync(file, `${JSON.stringify(session.getHeader())}\n`);
+      session = SessionManager.open(file);
+    }
+    const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+    let writable = true;
+    let lateWrites = 0;
+    const pi = {
+      registerTool: () => {},
+      registerCommand: () => {},
+      getCommands: () => [],
+      getActiveTools: () => ["workflow", "workflow_control"],
+      setActiveTools: () => {},
+      sendMessage: () => {},
+      appendEntry: (customType: string, data: unknown) => {
+        if (!writable) {
+          lateWrites++;
+          throw new Error("Session is no longer writable");
+        }
+        session.appendCustomEntry(customType, data);
+      },
+      on: (name: string, handler: (...args: any[]) => any) => {
+        handlers[name] ??= [];
+        handlers[name].push(handler);
+      },
+    } as unknown as ExtensionAPI;
+    install(pi);
+    handlers.session_start[0](
+      {},
+      {
+        cwd,
+        mode: "rpc",
+        modelRegistry: {},
+        sessionManager: session,
+        ui: { setWidget: () => {}, notify: () => {} },
+      },
+    );
+    return {
+      file,
+      id: session.getSessionId(),
+      get lateWrites() {
+        return lateWrites;
+      },
+      shutdown(event?: { reason?: string; targetSessionFile?: string }) {
+        handlers.session_shutdown[0](event);
+        writable = false;
+      },
+      replay() {
+        const runs = new Map<string, WorkflowProgress>();
+        const entries = SessionManager.open(file).getEntries();
+        for (const entry of entries) {
+          if (entry.type !== "custom" || entry.customType !== "pi-dynamic-workflows:progress") continue;
+          const packet = entry.data as WorkflowProgress | { version: 1; runId: string; deleted: true };
+          if ("deleted" in packet) runs.delete(packet.runId);
+          else runs.set(packet.runId, packet);
+        }
+        return runs;
+      },
+    };
+  }
+
+  it("retires outgoing progress before replacement and replays the adopted completion only in its owner", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-dw-progress-handoff-"));
+    try {
+      await withFakeHomeAsync(root, async () => {
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        for (const reason of ["new", "resume", "fork", "reload"] as const) {
+          discardWorkflowRuntime();
+          const cwd = join(root, reason);
+          let release!: (value: string) => void;
+          let started!: () => void;
+          const result = new Promise<string>((resolve) => (release = resolve));
+          const ready = new Promise<void>((resolve) => (started = resolve));
+          const manager = new WorkflowManager({
+            cwd,
+            agent: {
+              async run() {
+                started();
+                return result;
+              },
+            },
+          });
+          handoffWorkflowRuntime({
+            cwd,
+            extensionVersion: WORKFLOW_EXTENSION_VERSION,
+            manager,
+            effort: { level: "off" },
+          });
+          const outgoing = progressSession(installExtension, cwd);
+          const running = manager.startInBackground(
+            'export const meta = { name: "handoff", description: "handoff" }; return await agent("check");',
+          );
+          await ready;
+          assert.equal(outgoing.replay().get(running.runId)?.status, "running");
+          // A valid same-project destination lets resume use its native header probe.
+          const destination = SessionManager.create(cwd, join(cwd, "sessions"));
+          const destinationFile = destination.getSessionFile();
+          assert.ok(destinationFile);
+          writeFileSync(destinationFile, `${JSON.stringify(destination.getHeader())}\n`);
+          outgoing.shutdown({ reason, targetSessionFile: destinationFile });
+          assert.equal(outgoing.replay().has(running.runId), false, "retirement is durable before shutdown returns");
+          assert.equal(manager.getRun(running.runId)?.status, "running", "handoff keeps the execution alive");
+
+          const incoming = progressSession(
+            installExtension,
+            cwd,
+            reason === "reload" ? outgoing.file : destinationFile,
+          );
+          assert.equal(manager.getRun(running.runId)?.sessionId, incoming.id);
+          await Promise.resolve();
+          const adopted = incoming.replay().get(running.runId);
+          assert.equal(adopted?.status, "running");
+          assert.equal(adopted?.agents.length, 1, "the new observer restores the complete child snapshot");
+          assert.equal(adopted?.agents[0].status, "running");
+          release("adopted result");
+          await running.promise;
+          await Promise.resolve();
+          const completed = incoming.replay().get(running.runId);
+          assert.equal(completed?.status, "completed");
+          assert.equal(completed?.doneCount, 1);
+          assert.equal(completed?.resultPreview, "adopted result");
+          if (reason !== "reload") assert.equal(outgoing.replay().size, 0, "original session replay has no stale run");
+          else
+            assert.equal(outgoing.replay().get(running.runId)?.status, "completed", "reload updates the same history");
+          assert.equal(outgoing.lateWrites, 0);
+          incoming.shutdown({ reason: "quit" });
+        }
+      });
+    } finally {
+      discardWorkflowRuntime();
+      _resetDeliveryRegistriesForTests();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("persists paused progress before quit, unknown shutdown, and cross-project replacement return", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-dw-progress-pause-"));
+    try {
+      await withFakeHomeAsync(root, async () => {
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        for (const reason of ["quit", undefined, "resume"] as const) {
+          discardWorkflowRuntime();
+          const cwd = join(root, reason ?? "unknown");
+          let release!: (value: string) => void;
+          let started!: () => void;
+          const result = new Promise<string>((resolve) => (release = resolve));
+          const ready = new Promise<void>((resolve) => (started = resolve));
+          const manager = new WorkflowManager({
+            cwd,
+            agent: {
+              async run() {
+                started();
+                return result;
+              },
+            },
+          });
+          handoffWorkflowRuntime({
+            cwd,
+            extensionVersion: WORKFLOW_EXTENSION_VERSION,
+            manager,
+            effort: { level: "off" },
+          });
+          const outgoing = progressSession(installExtension, cwd);
+          const running = manager.startInBackground(
+            'export const meta = { name: "pause", description: "pause" }; return await agent("check");',
+          );
+          await ready;
+          assert.equal(outgoing.replay().get(running.runId)?.status, "running");
+          const foreign = join(root, "foreign.jsonl");
+          writeFileSync(foreign, `${JSON.stringify({ type: "session", cwd: root })}\n`);
+          outgoing.shutdown(reason ? { reason, targetSessionFile: foreign } : undefined);
+          assert.equal(outgoing.replay().get(running.runId)?.status, "paused", "pause must be durable synchronously");
+          assert.equal(takeWorkflowRuntime(), undefined, "paused runs are not handed off");
+          release("settled after shutdown");
+          await running.promise.catch(() => {});
+          await Promise.resolve();
+          assert.equal(outgoing.replay().get(running.runId)?.status, "paused");
+          assert.equal(outgoing.lateWrites, 0);
+        }
+      });
+    } finally {
+      discardWorkflowRuntime();
+      _resetDeliveryRegistriesForTests();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes progress in RPC sessions and detaches it on replacement", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-dw-rpc-progress-"));
+    try {
+      await withFakeHomeAsync(root, async () => {
+        for (const mode of ["tui", "rpc"] as const) {
+          discardWorkflowRuntime();
+          const cwd = join(root, mode);
+          const manager = new WorkflowManager({ cwd, agent: { run: async () => "verified" } });
+          handoffWorkflowRuntime({
+            cwd,
+            extensionVersion: WORKFLOW_EXTENSION_VERSION,
+            manager,
+            effort: { level: "off" },
+          });
+          const entries: Array<{ customType: string; data: any }> = [];
+          const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+          const pi = {
+            registerTool: () => {},
+            registerCommand: () => {},
+            getCommands: () => [],
+            getActiveTools: () => ["workflow", "workflow_control"],
+            setActiveTools: () => {},
+            sendMessage: () => {},
+            appendEntry: (customType: string, data: unknown) => entries.push({ customType, data }),
+            on: (name: string, handler: (...args: any[]) => any) => {
+              handlers[name] ??= [];
+              handlers[name].push(handler);
+            },
+          } as unknown as ExtensionAPI;
+          const { default: installExtension } = await import("../src/pi-extension.js");
+          installExtension(pi);
+          const context = {
+            cwd,
+            mode,
+            modelRegistry: {},
+            sessionManager: { getSessionId: () => `progress-${mode}` },
+            ui: { setWidget: () => {}, notify: () => {} },
+          };
+          handlers.session_start[0]({}, context);
+          handlers.session_start[0]({}, context);
+          const script = `export const meta = {name: "progress", description: "progress"};
+return await agent("verify", {label: "check"});`;
+          await manager.runSync(script);
+          await Promise.resolve();
+
+          if (mode === "rpc") {
+            const completed = entries.filter((entry) => entry.data.status === "completed");
+            assert.equal(completed.length, 1, "repeated session_start must not duplicate observers");
+            assert.equal(completed[0].customType, "pi-dynamic-workflows:progress");
+            assert.equal(completed[0].data.doneCount, 1);
+          } else {
+            assert.deepEqual(entries, [], "TUI sessions retain their existing progress panel");
+          }
+
+          handlers.session_shutdown[0]({ reason: "reload" });
+          const countAtShutdown = entries.length;
+          await manager.runSync(script);
+          await Promise.resolve();
+          assert.equal(entries.length, countAtShutdown, "the outgoing session must receive no late progress");
+          discardWorkflowRuntime();
+        }
+      });
+    } finally {
+      discardWorkflowRuntime();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("registers both control tools and hands the live runtime across reload", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-"));
     try {
       await withFakeHomeAsync(fakeHome, async () => {
         discardWorkflowRuntime(process.cwd());
+        saveWorkflowSettings({ defaultEffort: "high" });
         const registeredTools: string[] = [];
         const activeTools = ["bash", "read"];
         const handlers: Record<string, Array<(...args: any[]) => any>> = {};
@@ -382,7 +717,7 @@ describe("workflow extension - control tool availability", () => {
           },
           sendMessage: () => {},
         } as unknown as ExtensionAPI;
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
 
         installExtension(pi);
 
@@ -405,7 +740,8 @@ describe("workflow extension - control tool availability", () => {
         handlers.session_shutdown?.[0]?.({ reason: "reload" });
         const staged = takeWorkflowRuntime(process.cwd());
         assert.ok(staged, "session_shutdown(reload) stages the live manager for the next extension generation");
-        staged.effort.level = "high";
+        assert.equal(staged.effort.level, "high", "a fresh session applies the configured default effort");
+        staged.effort.level = "ultra";
         handoffWorkflowRuntime(staged);
 
         const secondHandlers: Record<string, Array<(...args: any[]) => any>> = {};
@@ -440,11 +776,260 @@ describe("workflow extension - control tool availability", () => {
         secondHandlers.session_shutdown?.[0]?.({ reason: "reload" });
         const restaged = takeWorkflowRuntime(process.cwd());
         assert.equal(restaged?.manager, staged.manager, "a compatible generation keeps the exact live manager");
-        assert.equal(restaged?.effort.level, "high", "session effort survives with the compatible runtime");
+        assert.equal(restaged?.effort.level, "ultra", "session effort survives with the compatible runtime");
         discardWorkflowRuntime(process.cwd());
       });
     } finally {
       rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("registers both tools with deferred exposure, inert on hosts without tool search", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-deferred-exposure-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        discardWorkflowRuntime(process.cwd());
+        const registeredTools: Array<{ name: string; exposure?: string }> = [];
+        const activeTools = ["bash", "read"];
+        const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+        const pi = {
+          registerTool: (tool: { name: string; exposure?: string }) => registeredTools.push(tool),
+          registerCommand: () => {},
+          getCommands: () => [],
+          on: (event: string, handler: (...args: any[]) => any) => {
+            if (!handlers[event]) handlers[event] = [];
+            handlers[event].push(handler);
+          },
+          getActiveTools: () => [...activeTools],
+          setActiveTools: (tools: string[]) => {
+            activeTools.splice(0, activeTools.length, ...tools);
+          },
+          sendMessage: () => {},
+        } as unknown as ExtensionAPI;
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        installExtension(pi);
+
+        assert.deepEqual(
+          registeredTools.slice(0, 2).map((tool) => [tool.name, tool.exposure]),
+          [
+            ["workflow", "deferred"],
+            ["workflow_control", "deferred"],
+          ],
+          "pi >= 0.99 defers the tools to tool_search; older hosts ignore the field and keep them active",
+        );
+
+        // No active tool_search: session_start must force-activate both, exactly
+        // as it did before deferral existed.
+        handlers.session_start[0](
+          {},
+          {
+            cwd: process.cwd(),
+            model: undefined,
+            modelRegistry: {},
+            sessionManager: { getSessionId: () => "session-deferred" },
+            ui: { setWidget: () => {}, notify: () => {} },
+          },
+        );
+        assert.ok(activeTools.includes("workflow"));
+        assert.ok(activeTools.includes("workflow_control"));
+
+        handlers.session_shutdown?.[0]?.({ reason: "reload" });
+        discardWorkflowRuntime(process.cwd());
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves the tools deferred when an active tool_search can discover them", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-deferred-toolsearch-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        discardWorkflowRuntime(process.cwd());
+        const activeTools = ["bash", "read", "tool_search"];
+        const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+        const pi = {
+          registerTool: () => {},
+          registerCommand: () => {},
+          getCommands: () => [],
+          on: (event: string, handler: (...args: any[]) => any) => {
+            if (!handlers[event]) handlers[event] = [];
+            handlers[event].push(handler);
+          },
+          getActiveTools: () => [...activeTools],
+          setActiveTools: (tools: string[]) => {
+            activeTools.splice(0, activeTools.length, ...tools);
+          },
+          sendMessage: () => {},
+        } as unknown as ExtensionAPI;
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        installExtension(pi);
+
+        handlers.session_start[0](
+          {},
+          {
+            cwd: process.cwd(),
+            model: undefined,
+            modelRegistry: {},
+            sessionManager: { getSessionId: () => "session-toolsearch" },
+            ui: { setWidget: () => {}, notify: () => {} },
+          },
+        );
+        assert.equal(activeTools.includes("workflow"), false, "searchable tools stay deferred (prompt relief)");
+        assert.equal(activeTools.includes("workflow_control"), false, "searchable tools stay deferred (prompt relief)");
+
+        handlers.session_shutdown?.[0]?.({ reason: "reload" });
+        discardWorkflowRuntime(process.cwd());
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("activates deferred control only in the current extension generation", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-deferred-liverun-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        discardWorkflowRuntime(process.cwd());
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        const outgoing = createDeferredHost();
+        installExtension(outgoing.pi);
+        outgoing.start(process.cwd());
+        assert.equal(outgoing.setCalls.length, 0, "tool_search keeps both tools deferred");
+
+        // Capture the real manager only after its outgoing host has shut down.
+        // A staged manager must not retain any control-activation subscription.
+        outgoing.shutdown("reload");
+        const staged = takeWorkflowRuntime(process.cwd());
+        assert.ok(staged);
+        for (const event of ["started", "resumed"]) {
+          staged.manager.emit(event, { runId: "run-1" });
+        }
+        assert.equal(outgoing.setCalls.length, 0, "handoff events must not mutate the outgoing host");
+        const detachedListenerCounts = [
+          staged.manager.listenerCount("started"),
+          staged.manager.listenerCount("resumed"),
+        ];
+        handoffWorkflowRuntime(staged);
+
+        const current = createDeferredHost();
+        installExtension(current.pi);
+        current.start(process.cwd());
+        current.start(process.cwd());
+        const liveListenerCounts = [staged.manager.listenerCount("started"), staged.manager.listenerCount("resumed")];
+        for (const event of ["started", "resumed"]) {
+          current.resetTools();
+          const before = current.setCalls.length;
+          staged.manager.emit(event, { runId: "run-1" });
+          assert.deepEqual(current.activeTools, ["bash", "read", "tool_search", "workflow_control"]);
+          assert.equal(current.setCalls.length, before + 1, `${event} activates only the control tool`);
+          staged.manager.emit(event, { runId: "run-1" });
+          assert.equal(current.setCalls.length, before + 1, "already active: no redundant loadout change");
+        }
+        assert.equal(outgoing.setCalls.length, 0, "only the incoming host receives setActiveTools");
+
+        current.resetTools();
+        current.shutdown("reload");
+        const next = createDeferredHost();
+        installExtension(next.pi);
+        next.start(process.cwd());
+        assert.deepEqual(
+          [staged.manager.listenerCount("started"), staged.manager.listenerCount("resumed")],
+          liveListenerCounts,
+          "repeated reloads do not accumulate listeners",
+        );
+        const previousCalls = current.setCalls.length;
+        staged.manager.emit("resumed", { runId: "run-1" });
+        assert.equal(next.setCalls.length, 1);
+        assert.equal(current.setCalls.length, previousCalls);
+        assert.equal(outgoing.setCalls.length, 0);
+
+        next.resetTools();
+        next.shutdown("quit");
+        // Shutdown is idempotent and leaves late events harmless even on quit.
+        next.shutdown("quit");
+        staged.manager.emit("started", { runId: "run-1" });
+        staged.manager.emit("resumed", { runId: "run-1" });
+        assert.equal(next.setCalls.length, 1);
+        assert.deepEqual(
+          [staged.manager.listenerCount("started"), staged.manager.listenerCount("resumed")],
+          detachedListenerCounts,
+          "shutdown removes generation-owned listeners but preserves shared delivery listeners",
+        );
+        discardWorkflowRuntime(process.cwd());
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("detaches deferred control activation before rebuilding for a different project", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-deferred-rebuild-home-"));
+    const destination = mkdtempSync(join(tmpdir(), "pi-dw-deferred-rebuild-project-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        discardWorkflowRuntime(process.cwd());
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        const seed = createDeferredHost();
+        installExtension(seed.pi);
+        seed.shutdown("reload");
+        const source = takeWorkflowRuntime(process.cwd());
+        assert.ok(source);
+        const detachedListenerCounts = [
+          source.manager.listenerCount("started"),
+          source.manager.listenerCount("resumed"),
+        ];
+        handoffWorkflowRuntime(source);
+
+        const current = createDeferredHost();
+        installExtension(current.pi);
+        current.start(destination);
+        source.manager.emit("started", { runId: "source-run" });
+        source.manager.emit("resumed", { runId: "source-run" });
+        assert.equal(current.setCalls.length, 0, "a replaced manager cannot activate tools in the new project");
+        assert.equal(seed.setCalls.length, 0);
+        assert.deepEqual(
+          [source.manager.listenerCount("started"), source.manager.listenerCount("resumed")],
+          detachedListenerCounts,
+        );
+
+        // Execute through the registered tool while the replacement is live.
+        // A shutdown/claim alone would miss a missing rebuild subscription.
+        const workflowTool = current.tools.find((tool) => tool.name === "workflow");
+        assert.ok(workflowTool);
+        await workflowTool.execute(
+          "rebuild-live",
+          { script: "export const meta = { name: 'rebuild', description: 'rebuild check' }; return 'ok'" },
+          undefined,
+          undefined,
+          undefined,
+        );
+        assert.equal(current.setCalls.length, 1, "a run on the rebuilt manager activates the current host");
+        assert.deepEqual(current.activeTools, ["bash", "read", "tool_search", "workflow_control"]);
+        assert.equal(seed.setCalls.length, 0);
+        current.resetTools();
+        current.shutdown("reload");
+        const rebuilt = takeWorkflowRuntime(destination);
+        assert.ok(rebuilt);
+        assert.notEqual(rebuilt.manager, source.manager);
+        assert.equal(rebuilt.manager.getCwd(), destination);
+        assert.deepEqual(
+          [rebuilt.manager.listenerCount("started"), rebuilt.manager.listenerCount("resumed")],
+          detachedListenerCounts,
+        );
+        handoffWorkflowRuntime(rebuilt);
+        const incoming = createDeferredHost();
+        installExtension(incoming.pi);
+        incoming.start(destination);
+        rebuilt.manager.emit("started", { runId: "destination-run" });
+        assert.equal(incoming.setCalls.length, 1, "the incoming manager has its own live subscription");
+        assert.equal(current.setCalls.length, 1);
+        incoming.shutdown("quit");
+        discardWorkflowRuntime();
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+      rmSync(destination, { recursive: true, force: true });
     }
   });
 
@@ -494,7 +1079,7 @@ describe("workflow extension - control tool availability", () => {
             },
             sendMessage: () => {},
           } as unknown as ExtensionAPI;
-          const { default: installExtension } = await import("../extensions/workflow.js");
+          const { default: installExtension } = await import("../src/pi-extension.js");
           installExtension(pi);
 
           handlers.session_shutdown?.[0]?.(event);
@@ -575,7 +1160,7 @@ describe("workflow extension - control tool availability", () => {
     const otherProject = mkdtempSync(join(tmpdir(), "pi-dw-other-resume-"));
     try {
       await withFakeHomeAsync(fakeHome, async () => {
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
         const makePi = (handlers: Record<string, Array<(...args: any[]) => any>>) =>
           ({
             registerTool: () => {},
@@ -763,7 +1348,7 @@ describe("workflow extension - control tool availability", () => {
           sendMessage: () => {},
         } as unknown as ExtensionAPI;
 
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
         installExtension(pi);
 
         assert.equal(
@@ -847,7 +1432,7 @@ describe("workflow extension - control tool availability", () => {
             },
             sendMessage: () => {},
           } as unknown as ExtensionAPI;
-          const { default: installExtension } = await import("../extensions/workflow.js");
+          const { default: installExtension } = await import("../src/pi-extension.js");
           installExtension(pi);
 
           assert.equal(handlers.model_select?.length, 1, "must listen for model_select");
@@ -913,7 +1498,7 @@ describe("workflow extension - control tool availability", () => {
           },
           _bound: false,
         } as unknown as ExtensionAPI & { _bound: boolean };
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
         installExtension(pi);
 
         handlers.session_shutdown?.[0]?.({ reason: "reload" });
@@ -992,6 +1577,58 @@ describe("workflow extension - control tool availability", () => {
     }
   });
 
+  it("loads default effort from the real session cwd only on its first start", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-default-effort-"));
+    const otherProject = mkdtempSync(join(tmpdir(), "pi-dw-default-effort-project-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        discardWorkflowRuntime(process.cwd());
+        saveWorkflowSettings({ defaultEffort: "high" });
+        saveWorkflowSettings({ defaultEffort: "ultra" }, { cwd: otherProject, scope: "project" });
+        const activeTools = ["bash", "read"];
+        const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+        const pi = {
+          registerTool: () => {},
+          registerCommand: () => {},
+          getCommands: () => [],
+          on: (event: string, handler: (...args: any[]) => any) => {
+            if (!handlers[event]) handlers[event] = [];
+            handlers[event].push(handler);
+          },
+          getActiveTools: () => [...activeTools],
+          setActiveTools: (tools: string[]) => {
+            activeTools.splice(0, activeTools.length, ...tools);
+          },
+          sendMessage: () => {},
+        } as unknown as ExtensionAPI;
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        installExtension(pi);
+
+        const context = {
+          cwd: otherProject,
+          model: undefined,
+          modelRegistry: {},
+          sessionManager: { getSessionId: () => "default-effort-session" },
+          ui: { setWidget: () => {}, notify: () => {} },
+        };
+        handlers.session_start[0]({}, context);
+        handlers.session_start[0]({}, context);
+        handlers.session_shutdown?.[0]?.({ reason: "reload" });
+
+        const staged = takeWorkflowRuntime(process.cwd());
+        assert.equal(
+          staged?.effort.level,
+          "ultra",
+          "ctx.cwd project settings win over the factory process.cwd settings and are not reset on repeat start",
+        );
+        discardWorkflowRuntime();
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+      rmSync(otherProject, { recursive: true, force: true });
+    }
+  });
+
   it("rebuilds the manager when session_start ctx.cwd differs from factory cwd", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-crosscwd-"));
     const otherProject = mkdtempSync(join(tmpdir(), "pi-dw-other-project-"));
@@ -1014,7 +1651,7 @@ describe("workflow extension - control tool availability", () => {
           },
           sendMessage: () => {},
         } as unknown as ExtensionAPI;
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
         installExtension(pi);
 
         handlers.session_shutdown?.[0]?.({ reason: "reload" });
@@ -1121,7 +1758,7 @@ describe("workflow extension - control tool availability", () => {
             },
             sendMessage: () => {},
           }) as unknown as ExtensionAPI;
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
 
         const installWithLiveRun = (runId: string) => {
           discardWorkflowRuntime();
@@ -1183,7 +1820,7 @@ describe("workflow extension - control tool availability", () => {
 
 describe("sessionFileCwd (read-only header probe)", () => {
   it("reads cwd from the session header without creating sidecars", async () => {
-    const { sessionFileCwd } = await import("../extensions/workflow.js");
+    const { sessionFileCwd } = await import("../src/pi-extension.js");
     const dir = mkdtempSync(join(tmpdir(), "pi-dw-session-probe-"));
     try {
       const file = join(dir, "session.jsonl");
@@ -1209,7 +1846,7 @@ describe("sessionFileCwd (read-only header probe)", () => {
   });
 
   it("returns undefined for missing, empty, or non-session files", async () => {
-    const { sessionFileCwd } = await import("../extensions/workflow.js");
+    const { sessionFileCwd } = await import("../src/pi-extension.js");
     assert.equal(sessionFileCwd(undefined), undefined);
     assert.equal(sessionFileCwd("/no/such/file.jsonl"), undefined);
     const dir = mkdtempSync(join(tmpdir(), "pi-dw-session-probe-bad-"));

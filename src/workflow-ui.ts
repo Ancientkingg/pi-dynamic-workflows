@@ -27,6 +27,7 @@ import type { AgentUsage } from "./agent.js";
 import type { ThemeLike, WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
 import { aggregateAgentUsage, fmtCost, fmtTokenSegment, tokenFigures } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
+import { runSummary } from "./run-record-store.js";
 import { registerSavedWorkflow, savedWorkflowCommandAvailability } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import {
@@ -143,6 +144,8 @@ interface RunRow {
   fresh: number;
   /** Cache-read tokens for the whole run. */
   cacheRead: number;
+  /** True when the displayed figures include character-heuristic estimates (#209). */
+  estimated: boolean;
   cost: number;
 }
 interface PhaseRow {
@@ -153,6 +156,8 @@ interface PhaseRow {
   fresh: number;
   /** Cache-read tokens summed across the phase's agents. */
   cacheRead: number;
+  /** True when any of the phase's agents reported heuristic-estimated figures (#209). */
+  estimated: boolean;
 }
 interface AgentRow {
   id: number;
@@ -243,6 +248,12 @@ export class NavigatorModel {
     return this.frameRuns;
   }
 
+  // Rehydrated persisted snapshots, keyed by the parsed record OBJECT
+  // (audit2 #25): avoid re-stringifying every agent's full result when
+  // browsing the same unchanged persisted record in subsequent frames.
+  // A fresh disk parse yields a new object, so invalidation is automatic.
+  private rehydratedSnapshot?: { record: PersistedRunState; value: { snapshot: WorkflowSnapshot; status: string } };
+
   private snapshot(runId: string): { snapshot: WorkflowSnapshot; status: string } | undefined {
     if (this.frameDepth > 0 && this.frameSnapshots.has(runId)) return this.frameSnapshots.get(runId);
     const live = this.manager.getRun(runId);
@@ -250,7 +261,13 @@ export class NavigatorModel {
       ? { snapshot: live.snapshot, status: live.status }
       : (() => {
           const p = this.persistedRuns().find((r) => r.runId === runId);
-          return p ? { snapshot: persistedToSnapshot(p), status: p.status } : undefined;
+          if (!p) return undefined;
+          let cached = this.rehydratedSnapshot?.record === p ? this.rehydratedSnapshot.value : undefined;
+          if (!cached) {
+            cached = { snapshot: persistedToSnapshot(p), status: p.status };
+            this.rehydratedSnapshot = { record: p, value: cached };
+          }
+          return cached;
         })();
     if (this.frameDepth > 0) this.frameSnapshots.set(runId, value);
     return value;
@@ -262,7 +279,8 @@ export class NavigatorModel {
       // Array guard (#110): a structurally corrupt persisted run (agents not an
       // array) would otherwise throw "agents is not iterable" here and crash the
       // runs list itself — i.e. /workflows would fail to open at all.
-      const rawAgents = live?.snapshot.agents ?? p.agents;
+      const summary = runSummary(p);
+      const rawAgents = live?.snapshot.agents ?? [];
       const agents = (Array.isArray(rawAgents) ? rawAgents : []) as WorkflowAgentSnapshot[];
       const usage = live?.snapshot.tokenUsage ?? p.tokenUsage;
       // The run-level aggregate is authoritative but only lands when the run
@@ -270,17 +288,18 @@ export class NavigatorModel {
       // tokens, so live runs show a count in the list (agreeing with the phase
       // view) and finished/legacy runs keep the final aggregate.
       const fromUsage = tokenFigures(usage);
-      const fromAgents = aggregateAgentUsage(agents);
+      const fromAgents = live ? aggregateAgentUsage(agents) : summary.usage;
       const figures =
         fromAgents.fresh + fromAgents.cacheRead > fromUsage.fresh + fromUsage.cacheRead ? fromAgents : fromUsage;
       return {
         runId: p.runId,
         name: asText(live?.snapshot.name ?? p.workflowName),
         status: live?.status ?? p.status,
-        done: agents.filter((a) => a.status === "done").length,
-        total: agents.length,
+        done: live ? agents.filter((a) => a.status === "done").length : summary.done,
+        total: live ? agents.length : summary.total,
         fresh: figures.fresh,
         cacheRead: figures.cacheRead,
+        estimated: figures.estimated,
         cost: usage?.cost ?? 0,
       };
     });
@@ -359,11 +378,15 @@ export class NavigatorModel {
     const order = Array.isArray(snap.phases) ? snap.phases.map(asText) : [];
     const byPhase = new Map<string, AgentRow[]>();
     const agents = Array.isArray(snap.agents) ? snap.agents : [];
+    const seenPhases = new Set<string>(order); // seeded: order starts from snap.phases
     for (const a of agents) {
       const key = agentPhaseKey(a);
       if (!byPhase.has(key)) byPhase.set(key, []);
       byPhase.get(key)?.push(a);
-      if (!order.includes(key)) order.push(key);
+      if (!seenPhases.has(key)) {
+        seenPhases.add(key);
+        order.push(key);
+      }
     }
     return order.map((title) => {
       const agents = byPhase.get(title) ?? [];
@@ -374,6 +397,7 @@ export class NavigatorModel {
         total: agents.length,
         fresh: usage.fresh,
         cacheRead: usage.cacheRead,
+        estimated: usage.estimated,
       };
     });
   }
@@ -428,6 +452,9 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
   const snapshotAgents = agents.map((a, callIndex) => {
     const journalResult = a.callId ? journalByCallId.get(a.callId) : journalByIndex.get(callIndex);
     const result = a.result === undefined && a.status === "done" ? journalResult : a.result;
+    // resultPreview for string results is the result itself — no extra
+    // stringify. Non-string results stringify ONCE here; callers browsing the
+    // same run hit the cache below instead of re-stringifying per frame.
     return {
       id: a.id,
       callId: a.callId,
@@ -445,6 +472,8 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       tokens: a.tokens,
       tokenUsage: a.tokenUsage,
       model: a.model,
+      sessionId: a.sessionId,
+      sessionFile: a.sessionFile,
     };
   });
   return {
@@ -618,9 +647,13 @@ export class NavigatorState {
   }
 
   /** Reconcile selection after any list/filter/manager change without drifting. */
-  reconcile(snapshot: NavigatorSnapshot, managerEvent = false): void {
+  reconcile(snapshot: NavigatorSnapshot): void {
     if (this.kind !== "runs") return;
-    if (managerEvent) this.cancelConfirmation();
+    // NOTE: a pending confirmation is deliberately NOT cancelled by manager
+    // events (audit2 #22) — tokenUsage alone fires ~4/s per streaming agent,
+    // so the double-tap window never survived. confirm() re-validates
+    // cursor/filter/context and the TARGET identity against the current item,
+    // so a stale confirmation cannot act on the wrong row.
     const top = this.top();
     const index = snapshot.items.findIndex((item) => sameIdentity(top.selected, item.identity));
     if (index >= 0) {
@@ -633,9 +666,11 @@ export class NavigatorState {
     top.cursor = snapshot.items.length ? Math.max(0, Math.min(top.cursor, snapshot.items.length - 1)) : 0;
     if (snapshot.items.length) top.selected = snapshot.items[top.cursor]?.identity;
   }
-  noteManagerEvent(snapshot: NavigatorSnapshot): void {
-    this.reconcile(snapshot, true);
-  }
+  /**
+   * @deprecated No-op kept for source compatibility: manager events no longer
+   * cancel confirmations (audit2 #22) and the render frame reconciles.
+   */
+  noteManagerEvent(_snapshot: NavigatorSnapshot): void {}
   currentItem(snapshot: NavigatorSnapshot): VisibleNavigatorItem | undefined {
     this.reconcile(snapshot);
     return snapshot.items.find((item) => sameIdentity(this.top().selected, item.identity));
@@ -1355,11 +1390,23 @@ function renderNavigatorFrame(
   const lines: string[] = [];
   let visibleSnapshot: NavigatorSnapshot | undefined;
   state.setPageSize(Math.max(1, viewportRows - 5));
+  // Resolve the selected identity ONCE per frame, lazily (audit2 #28):
+  // currentItem() reconciles and searches the full list — calling it per
+  // rendered row made every frame O(rows × items). Lazy because
+  // visibleSnapshot is only assigned inside the runs branch below.
+  let selectedIdentity: ItemIdentity | undefined;
+  let selectedIdentityResolved = false;
+  const selectedId = (): ItemIdentity | undefined => {
+    if (!selectedIdentityResolved) {
+      selectedIdentityResolved = true;
+      selectedIdentity = visibleSnapshot ? state.currentItem(visibleSnapshot)?.identity : undefined;
+    }
+    return selectedIdentity;
+  };
   const sel = (i: number, text: string) => {
     const selected =
       state.kind !== "runs" ||
-      (visibleSnapshot !== undefined &&
-        sameIdentity(visibleSnapshot.items[i]?.identity, state.currentItem(visibleSnapshot)?.identity));
+      (visibleSnapshot !== undefined && sameIdentity(visibleSnapshot.items[i]?.identity, selectedId()));
     return selected ? theme.fg("accent", theme.bold(`❯ ${text}`)) : `  ${text}`;
   };
   const dim = (t: string) => theme.fg("dim", t);
@@ -1524,7 +1571,8 @@ function renderNavigatorFrame(
     if (w) {
       const body: string[] = [];
       if (w.description) body.push(dim("Description: ") + asText(w.description));
-      body.push(dim("Location: ") + (w.location === "user" ? "user (~/.pi)" : "project (.pi)"));
+      body.push(dim("Location: ") + w.location);
+      body.push(dim("Path: ") + asText(w.path));
       body.push(dim("Saved at: ") + asText(w.savedAt));
       if (w.parameters) body.push(dim("Parameters: ") + JSON.stringify(w.parameters));
       body.push("", theme.fg("accent", theme.bold("Script:")));
@@ -1567,18 +1615,20 @@ function twoPaneHeader(
   let total = 0;
   let fresh = 0;
   let cacheRead = 0;
+  let estimated = false;
   for (const p of phases) {
     done += p.done;
     total += p.total;
     fresh += p.fresh;
     cacheRead += p.cacheRead;
+    if (p.estimated) estimated = true;
   }
   // Line 0 — name (accent + bold), truncated to width if needed.
   const nameText = truncateToWidth(name, width, ELLIPSIS, false);
   const line0 = theme.fg("accent", theme.bold(nameText));
 
   // Line 1 — left status, right summary.
-  const headerSegment = fmtTokenSegment({ fresh, cacheRead }, compactTokens);
+  const headerSegment = fmtTokenSegment({ fresh, cacheRead, estimated }, compactTokens);
   const rightRaw = `${done}/${total} ${pluralize("agent", total)}${headerSegment ? ` · ${headerSegment}` : ""}`;
   const rightW = visibleWidth(rightRaw);
   const gap = 2;
@@ -1958,7 +2008,11 @@ export function openWorkflowNavigator(
         "resumed",
       ];
       const onEvent = () => {
-        if (state.kind === "runs") state.noteManagerEvent(model.visible(state.filter));
+        // No eager model.visible() here (audit2 #23): each call rebuilds the
+        // entire visible model (storage.list() + a SHA-256 per saved script +
+        // runs aggregation), and events fire at ~4/s per streaming agent. The
+        // render frame computes model.visible() and reconciles selection
+        // itself, so the rebuild is coalesced into the frame.
         rerender();
       };
       for (const ev of events) manager.on(ev, onEvent);

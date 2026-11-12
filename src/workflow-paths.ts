@@ -9,8 +9,10 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { WORKFLOW_RUNS_DIR, WORKFLOW_SAVED_DIR } from "./config.js";
 
+/** Default workflow home, relative to the user home. Use workflowHomeDir() for the active path. */
 export const WORKFLOW_HOME_RELATIVE_DIR = ".pi/workflows";
 export const WORKFLOW_PROJECTS_SUBDIR = "projects";
 
@@ -20,11 +22,14 @@ export interface WorkflowProjectPaths {
   runsDir: string;
   savedDir: string;
   settingsPath: string;
+  modelTiersPath: string;
   legacyRunsDir: string;
   legacySavedDir: string;
 }
 
 export function workflowHomeDir(): string {
+  // Keep existing default state in place; custom Pi profiles own their workflow state.
+  if (process.env.PI_CODING_AGENT_DIR) return join(getAgentDir(), "workflows");
   return join(homedir(), WORKFLOW_HOME_RELATIVE_DIR);
 }
 
@@ -48,6 +53,7 @@ export function workflowProjectPaths(cwd: string): WorkflowProjectPaths {
     runsDir: join(rootDir, "runs"),
     savedDir: join(rootDir, "saved"),
     settingsPath: join(rootDir, "settings.json"),
+    modelTiersPath: join(rootDir, "model-tiers.json"),
     legacyRunsDir: resolve(cwd, WORKFLOW_RUNS_DIR),
     legacySavedDir: resolve(cwd, WORKFLOW_SAVED_DIR),
   };
